@@ -73,18 +73,16 @@ struct virtio_feature_desc {
 
 struct virtio_pnp_match {
 	uint32_t	 device_type;
-	uint8_t		iocap_supported;
 	const char	*description;
 };
 #define VIRTIO_SIMPLE_PNPINFO(driver, devtype, desc)			\
 	static const struct virtio_pnp_match driver ## _match = {	\
 		.device_type = devtype,					\
-		.iocap_supported = 0,					\
 		.description = desc,					\
 	};								\
-	MODULE_PNP_INFO("U32:device_type;U8:iocap_supported;D:#", virtio_mmio, driver,	\
+	MODULE_PNP_INFO("U32:device_type;D:#", virtio_mmio, driver,	\
 	    &driver ## _match, 1);					\
-	MODULE_PNP_INFO("U32:device_type;U8:iocap_supported;D:#", virtio_pci, driver,	\
+	MODULE_PNP_INFO("U32:device_type;D:#", virtio_pci, driver,	\
 	    &driver ## _match, 1)
 #define VIRTIO_SIMPLE_PROBE(dev, driver)				\
 	(virtio_simple_probe(dev, &driver ## _match))

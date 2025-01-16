@@ -282,15 +282,7 @@ VIRTIO_DRIVER_MODULE(virtio_blk_iocap, vtblk_iocap_driver, vtblk_iocap_modevent,
 MODULE_VERSION(virtio_blk_iocap, 1);
 MODULE_DEPEND(virtio_blk_iocap, virtio, 1, 1, 1);
 
-static const struct virtio_pnp_match virtio_blk_iocap_match = {
-    .device_type = VIRTIO_ID_BLOCK,
-    .iocap_supported = 1,
-    .description = "VirtIO Block Adapter + IOCap",
-};
-MODULE_PNP_INFO("U32:device_type;U8:iocap_supported;D:#", virtio_mmio, driver,	
-    &virtio_blk_iocap_match, 1);
-MODULE_PNP_INFO("U32:device_type;U8:iocap_supported;D:#", virtio_pci, driver,	
-    &virtio_blk_iocap_match, 1);
+VIRTIO_SIMPLE_PNPINFO(virtio_blk_iocap, VIRTIO_ID_BLOCK, "VirtIO Block Adapter (IOCap)");
 
 static int
 vtblk_iocap_modevent(module_t mod, int type, void *unused)
