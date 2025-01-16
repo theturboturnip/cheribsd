@@ -395,6 +395,21 @@ vtmmio_read_ivar(device_t dev, device_t child, int index, uintptr_t *result)
 		 */
 		*result = sc->vtmmio_version > 1;
 		break;
+	case VIRTIO_IVAR_IOCAPS:
+		{
+
+			uint64_t host_features = 0;
+
+			vtmmio_write_config_4(sc, VIRTIO_MMIO_HOST_FEATURES_SEL, 1);
+			host_features = vtmmio_read_config_4(sc, VIRTIO_MMIO_HOST_FEATURES);
+			host_features <<= 32;
+
+			vtmmio_write_config_4(sc, VIRTIO_MMIO_HOST_FEATURES_SEL, 0);
+			host_features |= vtmmio_read_config_4(sc, VIRTIO_MMIO_HOST_FEATURES);
+
+			*result = (host_features & VIRTIO_F_IOCAP_QUEUE) ? 1 : 0;
+		}
+		break;
 	default:
 		return (ENOENT);
 	}

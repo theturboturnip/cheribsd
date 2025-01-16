@@ -3564,6 +3564,7 @@ dev/virtio/mmio/virtio_mmio_if.m	optional	virtio_mmio
 dev/virtio/network/if_vtnet.c		optional	vtnet
 dev/virtio/balloon/virtio_balloon.c	optional	virtio_balloon
 dev/virtio/block/virtio_blk.c		optional	virtio_blk
+dev/virtio/block/virtio_blk_iocap.c		optional	virtio_blk_iocap
 dev/virtio/console/virtio_console.c	optional	virtio_console
 dev/virtio/gpu/virtio_gpu.c		optional	virtio_gpu
 dev/virtio/p9fs/virtio_p9fs.c		optional	virtio_p9fs

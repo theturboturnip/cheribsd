@@ -297,6 +297,10 @@ vtpci_read_ivar(struct vtpci_common *cn, int index, uintptr_t *result)
 	case VIRTIO_IVAR_MODERN:
 		*result = vtpci_is_modern(cn);
 		break;
+	case VIRTIO_IVAR_IOCAPS:
+		// IOCaps do not support IOCaps-over-PCI.
+		*result = 0;
+		break;
 	default:
 		error = ENOENT;
 	}

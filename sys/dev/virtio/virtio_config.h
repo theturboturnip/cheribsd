@@ -85,4 +85,13 @@
 #define VIRTIO_TRANSPORT_F_START	28
 #define VIRTIO_TRANSPORT_F_END		34
 
+/*
+ * Does the device use IOCaps as virtio descriptors?
+ * Must be mutually exclusive with VIRTIO_F_RING_PACKED.
+ * TODO Rename to VIRTIO_F_RING_IOCAP and put inside the 28-38 space.
+ * TODO Note that on Linux this is already taken by VIRTIO_F_ADMIN_VQ
+ * https://github.com/torvalds/linux/blob/master/include/uapi/linux/virtio_config.h
+ */
+#define VIRTIO_F_IOCAP_QUEUE		(1ULL << 41)
+
 #endif /* _VIRTIO_CONFIG_H_ */

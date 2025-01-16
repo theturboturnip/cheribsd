@@ -60,6 +60,7 @@ struct vq_alloc_info;
 #define VIRTIO_IVAR_SUBVENDOR		5
 #define VIRTIO_IVAR_SUBDEVICE		6
 #define VIRTIO_IVAR_MODERN		7
+#define VIRTIO_IVAR_IOCAPS		8
 
 struct virtio_feature_desc {
 	uint64_t	 vfd_val;
@@ -72,16 +73,18 @@ struct virtio_feature_desc {
 
 struct virtio_pnp_match {
 	uint32_t	 device_type;
+	uint8_t		iocap_supported;
 	const char	*description;
 };
 #define VIRTIO_SIMPLE_PNPINFO(driver, devtype, desc)			\
 	static const struct virtio_pnp_match driver ## _match = {	\
 		.device_type = devtype,					\
+		.iocap_supported = 0,					\
 		.description = desc,					\
 	};								\
-	MODULE_PNP_INFO("U32:device_type;D:#", virtio_mmio, driver,	\
+	MODULE_PNP_INFO("U32:device_type;U8:iocap_supported;D:#", virtio_mmio, driver,	\
 	    &driver ## _match, 1);					\
-	MODULE_PNP_INFO("U32:device_type;D:#", virtio_pci, driver,	\
+	MODULE_PNP_INFO("U32:device_type;U8:iocap_supported;D:#", virtio_pci, driver,	\
 	    &driver ## _match, 1)
 #define VIRTIO_SIMPLE_PROBE(dev, driver)				\
 	(virtio_simple_probe(dev, &driver ## _match))
@@ -162,6 +165,7 @@ VIRTIO_READ_IVAR(device,	VIRTIO_IVAR_DEVICE);
 VIRTIO_READ_IVAR(subvendor,	VIRTIO_IVAR_SUBVENDOR);
 VIRTIO_READ_IVAR(subdevice,	VIRTIO_IVAR_SUBDEVICE);
 VIRTIO_READ_IVAR(modern,	VIRTIO_IVAR_MODERN);
+VIRTIO_READ_IVAR(iocap_support,	VIRTIO_IVAR_IOCAPS);
 
 #undef VIRTIO_READ_IVAR
 
