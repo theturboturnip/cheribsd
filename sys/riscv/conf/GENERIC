@@ -92,6 +92,9 @@ device		riscv_syscon
 # Bus drivers
 device		pci
 
+# IOCap driver
+device		iocap # TODO move this into an iocap-specific config?
+
 # Block devices
 device		ahci
 device		scbus
@@ -102,7 +105,7 @@ device		virtio			# Generic VirtIO bus (required)
 device		virtio_pci		# VirtIO PCI device
 device		vtnet			# VirtIO Ethernet device
 device		virtio_blk		# VirtIO Block device
-device		virtio_blk_iocap		# VirtIO Block device + iocaps TODO move this into an iocap-specific config?
+device		virtio_iocap	# IOCap-enabled virtio devices TODO move this into an iocap-specific config?
 device		virtio_mmio		# VirtIO MMIO bus
 
 # ATA/SCSI peripherals

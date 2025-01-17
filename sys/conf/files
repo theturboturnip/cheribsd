@@ -1963,6 +1963,8 @@ dev/igc/igc_nvm.c		optional igc iflib pci
 dev/igc/igc_phy.c		optional igc iflib pci
 dev/igc/igc_txrx.c		optional igc iflib pci
 dev/intpm/intpm.c		optional intpm pci
+dev/iocap/iocap_keymngr.c	optional iocap
+dev/iocap/libccap/libccap.c	optional iocap
 # XXX Work around clang warning, until maintainer approves fix.
 dev/ips/ips.c			optional ips \
 	compile-with "${NORMAL_C} ${NO_WSOMETIMES_UNINITIALIZED}"
