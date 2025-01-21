@@ -1,4 +1,4 @@
-// Probing and setup baed on uart_bus_fdt.c
+// Probing and setup based on uart_bus_fdt.c
 
 #include <sys/types.h>
 #include <sys/param.h>
@@ -18,9 +18,14 @@
 static int iocap_keymngr_probe(device_t);
 static int iocap_keymngr_attach(device_t);
 static int iocap_keymngr_detach(device_t);
+static void iocap_keymngr_dbg_perfcounters(device_t);
 
 struct iocap_keymngr_softc {
 	device_t	dev;
+
+	// see sys/dev/uart/uart.h
+	bus_space_tag_t bst;
+	bus_space_handle_t bsh;
 
 	struct resource	*sc_rres;	/* Register resource. */
 	int		sc_rrid;
@@ -28,11 +33,6 @@ struct iocap_keymngr_softc {
 
 	// bus_dma_tag_t	sc_dmat;
 	// struct mtx		 iocap_keymngr_mtx;
-};
-
-static struct ofw_compat_data compat_data[] = {
-	{ "sws35,iocap_keymngr",	1 },
-	{ NULL, 0 }
 };
 
 static device_method_t iocap_keymngr_methods[] = {
@@ -52,29 +52,31 @@ static driver_t iocap_keymngr_driver = {
 static int
 iocap_keymngr_probe(device_t dev)
 {
-	const struct ofw_compat_data *ocd;
-
 	if (!ofw_bus_status_okay(dev))
 		return (ENXIO);
 
-	ocd = ofw_bus_search_compatible(dev, compat_data);
-	if (ocd->ocd_data == 0)
-		return (ENXIO);
+	if (ofw_bus_is_compatible(dev, "sws35,iocap_keymngr")) {
+		device_set_desc(dev, "IOCap Key Manager");
+		return (BUS_PROBE_DEFAULT);
+	}
 
-	device_set_desc(dev, "IOCap Key Manager");
-	return (BUS_PROBE_DEFAULT);
+	return (ENXIO);
 }
 
 static int
 iocap_keymngr_attach(device_t dev)
 {
- 	device_printf(dev, "w00t attached to iocap!!!\n");
+ 	device_printf(dev, "w00t attached to iocap!!! parent: %p\n", device_get_parent(dev));
 
 	struct iocap_keymngr_softc *sc;
+	// phandle_t node;
 	int error;
 
 	sc = device_get_softc(dev);
+	// node = ofw_bus_get_node(dev);
 	error = 0;
+
+	// Step one: get the register block allocated for the key manager.
 
 	// From uart_core.c:uart_bus_probe
 	/*
@@ -84,21 +86,24 @@ iocap_keymngr_attach(device_t dev)
 	 * consequently not be supported by this driver as-is. We try I/O
 	 * port space first because that's the common case.
 	 */
+	// See also goldfish_rtc.c
+
+	// Get the resource
 	sc->sc_rrid = 0;
-	sc->sc_rtype = SYS_RES_IOPORT;
-	sc->sc_rres = bus_alloc_resource_any(dev, sc->sc_rtype, &sc->sc_rrid,
+	sc->sc_rres = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &sc->sc_rrid,
 	    RF_ACTIVE);
 	if (sc->sc_rres == NULL) {
-		sc->sc_rrid = 0;
-		sc->sc_rtype = SYS_RES_MEMORY;
-		sc->sc_rres = bus_alloc_resource_any(dev, sc->sc_rtype,
-		    &sc->sc_rrid, RF_ACTIVE);
-		if (sc->sc_rres == NULL) {
-			device_printf(dev, "unable to allocate memory\n");
-			error = 1; // TODO error code
-			goto fail;
-		}
+		device_printf(dev, "could not allocate resource\n");
+		return (ENXIO);
 	}
+	// Get the mapped memory for the resource
+	sc->bsh = rman_get_bushandle(sc->sc_rres);
+	sc->bst = rman_get_bustag(sc->sc_rres);
+
+	if (error != 0)
+		goto fail;
+
+	iocap_keymngr_dbg_perfcounters(dev);
 
 	// TODO setup lock
 
@@ -153,13 +158,22 @@ iocap_keymngr_detach(device_t dev)
 	return 0;
 }
 
-// 	// node = ofw_bus_get_node(dev);
-//
+static void iocap_keymngr_dbg_perfcounters(device_t dev)
+{
+	struct iocap_keymngr_softc *sc;
 
-//
-//
-// 	return BUS_PROBE_DEFAULT;
-// }
+	sc = device_get_softc(dev);
+
+	// device_printf(dev, "iocap_keymngr_dbg_perfcounters bst %p bsh %zu bsz %zu\n", sc->bst, (size_t)sc->bsh, (size_t)sc->bsz);
+	uint64_t good_read  = bus_space_read_8(sc->bst, sc->bsh, 0x1000);
+	// device_printf(dev, "iocap_keymngr_dbg_perfcounters good_read\n");
+	uint64_t bad_read   = bus_space_read_8(sc->bst, sc->bsh, 0x1008);
+	// device_printf(dev, "iocap_keymngr_dbg_perfcounters bad_read\n");
+	uint64_t good_write = bus_space_read_8(sc->bst, sc->bsh, 0x1010);
+	// device_printf(dev, "iocap_keymngr_dbg_perfcounters good_write\n");
+	uint64_t bad_write  = bus_space_read_8(sc->bst, sc->bsh, 0x1018);
+	device_printf(dev, "perf counters: %ld %ld %ld %ld\n", good_read, bad_read, good_write, bad_write);
+}
 
 // TODO make this EARLY_?
 DRIVER_MODULE(iocap_keymngr, simplebus, iocap_keymngr_driver, 0, 0);
