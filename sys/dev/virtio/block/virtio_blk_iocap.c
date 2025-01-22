@@ -49,6 +49,7 @@
 #include <sys/bus.h>
 #include <sys/rman.h>
 
+#include <dev/iocap/iocap_keymngr.h>
 #include <dev/virtio/virtio.h>
 #include <dev/virtio/virtqueue.h> // TODO swap out for virtqueue_iocap once we get that working
 #include <dev/virtio/block/virtio_blk.h>
@@ -311,7 +312,10 @@ vtblk_iocap_probe(device_t dev)
 	if (virtio_get_device_type(dev) != virtio_blk_iocap_match.device_type)
 		return (ENXIO);
 	// If IOCaps are not supported by the device, reject it. The no-IOCap-specific driver will pick it up.
+	// TODO search the parent chain for a IOCap-capable bus. If it isn't present, drop to the IOCap driver.
 	if (virtio_get_iocap_support(dev) == 0)
+		return (ENXIO);
+	if (bus_dma_tag_iocap_refinable(bus_get_dma_tag(dev)) == 0)
 		return (ENXIO);
 	device_set_desc(dev, virtio_blk_iocap_match.description);
 	return (BUS_PROBE_DEFAULT);
@@ -396,6 +400,7 @@ vtblk_iocap_attach(device_t dev)
 	    busdma_lock_mutex,				/* lockfunc */
 	    &sc->vtblk_iocap_mtx,				/* lockarg */
 	    &sc->vtblk_iocap_dmat);
+	// TODO try to refine the dmatag with a iocap-bus specific function
 	if (error) {
 		device_printf(dev, "cannot create bus dma tag\n");
 		goto fail;

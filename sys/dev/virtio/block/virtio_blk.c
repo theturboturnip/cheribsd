@@ -49,6 +49,7 @@
 #include <sys/bus.h>
 #include <sys/rman.h>
 
+#include <dev/iocap/iocap_keymngr.h>
 #include <dev/virtio/virtio.h>
 #include <dev/virtio/virtqueue.h>
 #include <dev/virtio/block/virtio_blk.h>
@@ -310,9 +311,13 @@ vtblk_probe(device_t dev)
 {
 	if (virtio_get_device_type(dev) != virtio_blk_match.device_type)
 		return (ENXIO);
-	// If IOCaps are supported by the device, reject it. The IOCap-specific driver will pick it up.
-	if (virtio_get_iocap_support(dev) != 0)
-		return (ENXIO);
+	// If IOCaps are supported by the device, and our bus returns tags which we can refine with IOCap support,
+	// reject the device. The IOCap-specific driver will pick it up.
+	if (virtio_get_iocap_support(dev) != 0) {
+		if (bus_dma_tag_iocap_refinable(bus_get_dma_tag(dev)) == 1) {
+			return (ENXIO);
+		}
+	}
 	device_set_desc(dev, virtio_blk_match.description);
 	return (BUS_PROBE_DEFAULT);
 }
