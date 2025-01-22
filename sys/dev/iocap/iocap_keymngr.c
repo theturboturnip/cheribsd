@@ -15,12 +15,16 @@
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
 
+#include "dev/fdt/simplebus.h"
+
 static int iocap_keymngr_probe(device_t);
 static int iocap_keymngr_attach(device_t);
 static int iocap_keymngr_detach(device_t);
 static void iocap_keymngr_dbg_perfcounters(device_t);
 
 struct iocap_keymngr_softc {
+	struct simplebus_softc base;
+
 	device_t	dev;
 
 	// see sys/dev/uart/uart.h
@@ -43,11 +47,12 @@ static device_method_t iocap_keymngr_methods[] = {
 	{ 0, 0 }
 };
 
-static driver_t iocap_keymngr_driver = {
-	"iocap_keymngr",
-	iocap_keymngr_methods,
-	sizeof(struct iocap_keymngr_softc),
-};
+DEFINE_CLASS_1(iocap_keymngr, iocap_keymngr_driver, iocap_keymngr_methods,
+	sizeof(struct iocap_keymngr_softc), simplebus_driver);
+
+EARLY_DRIVER_MODULE(iocap_keymngr, ofwbus, iocap_keymngr_driver, 0, 0, BUS_PASS_BUS);
+EARLY_DRIVER_MODULE(iocap_keymngr, simplebus, iocap_keymngr_driver, 0, 0,
+	BUS_PASS_BUS + BUS_PASS_ORDER_MIDDLE);
 
 static int
 iocap_keymngr_probe(device_t dev)
@@ -94,14 +99,12 @@ iocap_keymngr_attach(device_t dev)
 	    RF_ACTIVE);
 	if (sc->sc_rres == NULL) {
 		device_printf(dev, "could not allocate resource\n");
-		return (ENXIO);
+		error = ENXIO;
+		goto fail;
 	}
 	// Get the mapped memory for the resource
 	sc->bsh = rman_get_bushandle(sc->sc_rres);
 	sc->bst = rman_get_bustag(sc->sc_rres);
-
-	if (error != 0)
-		goto fail;
 
 	iocap_keymngr_dbg_perfcounters(dev);
 
@@ -130,15 +133,21 @@ iocap_keymngr_attach(device_t dev)
 	// }
 
 	fail:
-	if (error)
+	if (error) {
 		iocap_keymngr_detach(dev);
+		return (error);
+	}
 
-	return (error);
+	return simplebus_attach(dev);
 }
 
 static int
 iocap_keymngr_detach(device_t dev)
 {
+	int err = simplebus_detach(dev);
+	if (err != 0)
+		return err;
+
 	struct iocap_keymngr_softc *sc;
 
 	sc = device_get_softc(dev);
@@ -155,7 +164,7 @@ iocap_keymngr_detach(device_t dev)
 
 	// TODO destroy lock
 
-	return 0;
+	return err;
 }
 
 static void iocap_keymngr_dbg_perfcounters(device_t dev)
@@ -174,7 +183,3 @@ static void iocap_keymngr_dbg_perfcounters(device_t dev)
 	uint64_t bad_write  = bus_space_read_8(sc->bst, sc->bsh, 0x1018);
 	device_printf(dev, "perf counters: %ld %ld %ld %ld\n", good_read, bad_read, good_write, bad_write);
 }
-
-// TODO make this EARLY_?
-DRIVER_MODULE(iocap_keymngr, simplebus, iocap_keymngr_driver, 0, 0);
-DRIVER_MODULE(iocap_keymngr, ofwbus, iocap_keymngr_driver, 0, 0);
