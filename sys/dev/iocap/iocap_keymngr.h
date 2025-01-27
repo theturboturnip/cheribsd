@@ -1,6 +1,8 @@
 #ifndef IOCAP_KEYMNGR_H
 #define IOCAP_KEYMNGR_H
 
+#include <dev/iocap/iocap.h>
+
 // ======= IOCap DMA Tags =======
 
 // The IOCap system slightly misuses the DMA tag system.

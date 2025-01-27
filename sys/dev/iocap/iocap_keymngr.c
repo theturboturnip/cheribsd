@@ -59,8 +59,8 @@ struct bus_dma_iocap_enabled_tag {
 	int32_t map_count;
 };
 
-//								 IOCapabilite
-#define BUS_IOCAP_DMAMAP_MAGIC 0x10CA9AB11173
+//                               IOCapblt
+#define BUS_IOCAP_DMAMAP_MAGIC 0x10CA9B17u
 
 // DMA maps have a simple lifecycle.
 // When they are initially created, they have no actual mapping loaded into them - creation simply
@@ -454,9 +454,9 @@ static CCapU128 *iocap_keymngr_get_and_lock_key(device_t dev, uint8_t key_id)
 
 static void iocap_keymngr_unlock_key(device_t dev, uint8_t key_id)
 {
-	struct iocap_keymngr_softc *sc;
-
-	sc = device_get_softc(dev);
+	// struct iocap_keymngr_softc *sc;
+	//
+	// sc = device_get_softc(dev);
 
 	// TODO release lock on key
 }
@@ -1086,11 +1086,14 @@ iocap_keymngr_get_dma_tag(device_t dev, device_t child)
 bus_dma_iocap_refinable_tag_t
 bus_dma_tag_iocap_refinable(bus_dma_tag_t tag)
 {
+	if (tag == NULL) {
+		return NULL;
+	}
 	if (((struct bus_dma_tag_common *)tag)->impl == &
 		bus_dma_iocap_refinable_tag_impl) {
 		return (bus_dma_iocap_refinable_tag_t)tag;
 	}
-	return 0;
+	return NULL;
 }
 
 int
@@ -1145,6 +1148,9 @@ bus_dma_tag_refine_to_iocap_group(bus_dma_iocap_refinable_tag_t tag,
 bus_iocap_dmamap_t
 bus_dmamap_can_mint_iocap(bus_dmamap_t map)
 {
+	if (map == NULL) {
+		return NULL;
+	}
 	if (((bus_iocap_dmamap_t)map)->magic == BUS_IOCAP_DMAMAP_MAGIC) {
 		return (bus_iocap_dmamap_t)map;
 	}
@@ -1227,7 +1233,7 @@ bus_dmamap_mint_virtio_iocap(bus_iocap_dmamap_t map, bus_dma_segment_t *segment,
 	key = iocap_keymngr_get_and_lock_key(map->tag->iocap_keymngr, key_id);
 
 	if (key != NULL) {
-		desc = CCapNativeVirtqDesc {
+		desc = (CCapNativeVirtqDesc) {
 			.addr = segment->ds_addr,
 			.len = segment->ds_len,
 			.flags = flags,
