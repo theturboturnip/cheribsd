@@ -28,7 +28,8 @@
 = 1 / (msg && (x)) }
 
 // static_assert(offsetof(struct bus_dma_tag, common) == 0, "struct bus_dma_tag must start with a bus_dma_tag_common field");
-static_assert(offsetof(struct bus_dma_tag_common, impl) == 0, "struct bus_dma_tag_common must start with an impl vtable");
+static_assert(offsetof(struct bus_dma_tag_common, impl) == 0,
+		"struct bus_dma_tag_common must start with an impl vtable");
 
 static MALLOC_DEFINE(M_IOCAP_DMAMAP, "iocap_dmamap", "IOCAP DMA Map");
 
@@ -39,7 +40,7 @@ struct bus_dma_iocap_refinable_tag {
 	device_t iocap_keymngr;
 	// Unfortunate reality: we need to malloc() a pointer to (struct bus_dma_tag) by getting a DMA tag from our parent,
 	// we can't redirect calls here.
-	bus_dma_tag_t wrapper_ptr_to_base_tag;
+	bus_dma_tag_t base_tag;
 	// TODO IS THIS NECESSARY
 	// // Set to true if there are any non-iocap mappings created through this tag.
 	// // If so, we don't refine it(?)
@@ -48,7 +49,7 @@ struct bus_dma_iocap_refinable_tag {
 
 struct bus_dma_iocap_enabled_tag {
 	struct bus_dma_tag_common common;
-	bus_dma_tag_t wrapper_ptr_to_base_tag;
+	bus_dma_tag_t base_tag;
 	device_t iocap_keymngr;
 	enum iocap_keymngr_revocation_mode revocation_mode;
 	uint8_t n_keys;
@@ -136,7 +137,7 @@ struct bus_iocap_dmamap {
 	// A magic number that identifies this as an IOCap-capable mapping
 	uint32_t magic;
 	enum bus_iocap_dmamap_state state;
-	bus_dmamap_t wrapper_ptr_to_base_map;
+	bus_dmamap_t base_map;
 	struct bus_dma_iocap_enabled_tag *tag;
 	int nth_key_of_tag;
 };
@@ -145,49 +146,10 @@ struct bus_iocap_dmamap {
 struct bus_dma_impl bus_dma_iocap_refinable_tag_impl;
 
 static int iocap_keymngr_probe(device_t);
+
 static int iocap_keymngr_attach(device_t);
+
 static int iocap_keymngr_detach(device_t);
-static void iocap_keymngr_dbg_perfcounters(device_t);
-
-// Assign n_key_ids key IDs to a tag, without reusing key IDs already assigned to other tags
-static int iocap_keymngr_alloc_key_ids(device_t, uint8_t *key_ids, uint8_t n_key_ids);
-// Fill the key data for this id with random data so it can be used to mint iocaps.
-// Takes the lock for the key.
-static void iocap_keymngr_init_key(device_t, uint8_t key_id);
-// Retrieve the key data for this id so we can use it to mint an IOCap,
-// and takes the lock on the key so it doesn't change while minting.
-// Return NULL if not inited, and still takes the lock in this case.
-// Must call iocap_keymngr_unlock_key() after using the key to release it to others.
-// TODO figure out how this interacts with locks in the NULL case. Does this function take the lock?
-static CCapU128* iocap_keymngr_get_and_lock_key(device_t, uint8_t key_id);
-static void iocap_keymngr_unlock_key(device_t, uint8_t key_id);
-// Clear out the key data for this ID.
-// Takes the lock for the key while clearing.
-static void iocap_keymngr_clear_key(device_t, uint8_t key_id);
-// Clear data for all given key IDs and mark them as not-allocated so other tags can reuse them.
-static int iocap_keymngr_free_key_ids(device_t, uint8_t *key_ids, uint8_t n_key_ids);
-
-
-// Increment the refcount for a key on a given tag.
-// If the refcount increases from zero for that key call iocap_keymngr_init_key.
-static int iocap_enabled_tag_inc_refcount(bus_dma_iocap_enabled_tag_t tag, uint8_t nth_key_of_tag) {
-	// TODO take a lock on the tag
-	tag->key_refcounts[nth_key_of_tag]++;
-	if (tag->key_refcounts[nth_key_of_tag] == 1) {
-		iocap_keymngr_init_key(tag->iocap_keymngr, tag->allocated_keys[nth_key_of_tag]);
-	}
-	return 0;
-}
-// Decremnt the refcount for a key on a given tag.
-// When the refcount hits zero, call iocap_keymngr_clear_key to clear the key data but keep the key index allocated.
-static int iocap_enabled_tag_dec_refcount(bus_dma_iocap_enabled_tag_t tag, uint8_t nth_key_of_tag) {
-	// TODO take a lock on the tag
-	tag->key_refcounts[nth_key_of_tag]--;
-	if (tag->key_refcounts[nth_key_of_tag] == 0) {
-		iocap_keymngr_clear_key(tag->iocap_keymngr, tag->allocated_keys[nth_key_of_tag]);
-	}
-	return 0;
-}
 
 static bus_get_dma_tag_t iocap_keymngr_get_dma_tag;
 
@@ -204,15 +166,15 @@ struct iocap_key_state {
 struct iocap_keymngr_softc {
 	struct simplebus_softc base;
 
-	device_t	dev;
+	device_t dev;
 
 	// see sys/dev/uart/uart.h
 	bus_space_tag_t bst;
 	bus_space_handle_t bsh;
 
-	struct resource	*sc_rres;	/* Register resource. */
-	int		sc_rrid;
-	int		sc_rtype;	/* SYS_RES_{IOPORT|MEMORY}. */
+	struct resource *sc_rres; /* Register resource. */
+	int sc_rrid;
+	int sc_rtype; /* SYS_RES_{IOPORT|MEMORY}. */
 
 	// bus_dma_tag_t	sc_dmat;
 	// struct mtx		 iocap_keymngr_mtx;
@@ -224,21 +186,81 @@ struct iocap_keymngr_softc {
 
 static device_method_t iocap_keymngr_methods[] = {
 	/* Device interface */
-	DEVMETHOD(device_probe,		iocap_keymngr_probe),
-	DEVMETHOD(device_attach,	iocap_keymngr_attach),
-	DEVMETHOD(device_detach,	iocap_keymngr_detach),
+	DEVMETHOD(device_probe, iocap_keymngr_probe),
+	DEVMETHOD(device_attach, iocap_keymngr_attach),
+	DEVMETHOD(device_detach, iocap_keymngr_detach),
 
-	DEVMETHOD(bus_get_dma_tag,	iocap_keymngr_get_dma_tag),
+	DEVMETHOD(bus_get_dma_tag, iocap_keymngr_get_dma_tag),
 
 	{ 0, 0 }
 };
 
 DEFINE_CLASS_1(iocap_keymngr, iocap_keymngr_driver, iocap_keymngr_methods,
-	sizeof(struct iocap_keymngr_softc), simplebus_driver);
+		sizeof(struct iocap_keymngr_softc), simplebus_driver);
 
-EARLY_DRIVER_MODULE(iocap_keymngr, ofwbus, iocap_keymngr_driver, 0, 0, BUS_PASS_BUS);
+EARLY_DRIVER_MODULE(iocap_keymngr, ofwbus, iocap_keymngr_driver, 0, 0,
+		BUS_PASS_BUS);
 EARLY_DRIVER_MODULE(iocap_keymngr, simplebus, iocap_keymngr_driver, 0, 0,
-	BUS_PASS_BUS + BUS_PASS_ORDER_MIDDLE);
+		BUS_PASS_BUS + BUS_PASS_ORDER_MIDDLE);
+
+
+static void iocap_keymngr_dbg_perfcounters(device_t);
+
+// Assign n_key_ids key IDs to a tag, without reusing key IDs already assigned to other tags
+static int iocap_keymngr_alloc_key_ids(device_t, uint8_t *key_ids,
+		uint8_t n_key_ids);
+// Fill the key data for this id with random data so it can be used to mint iocaps.
+// Takes the lock for the key.
+static void iocap_keymngr_init_key(device_t, uint8_t key_id);
+
+// Retrieve the key data for this id so we can use it to mint an IOCap,
+// and takes the lock on the key so it doesn't change while minting.
+// Return NULL if not inited, and still takes the lock in this case.
+// Must call iocap_keymngr_unlock_key() after using the key to release it to others.
+// TODO figure out how this interacts with locks in the NULL case. Does this function take the lock?
+static CCapU128 *iocap_keymngr_get_and_lock_key(device_t, uint8_t key_id);
+
+static void iocap_keymngr_unlock_key(device_t, uint8_t key_id);
+
+// Clear out the key data for this ID.
+// Takes the lock for the key while clearing.
+static void iocap_keymngr_clear_key(device_t, uint8_t key_id);
+
+// Clear data for all given key IDs and mark them as not-allocated so other tags can reuse them.
+static void iocap_keymngr_free_key_ids(device_t, uint8_t *key_ids,
+		uint8_t n_key_ids);
+
+
+// Increment the refcount for a key on a given tag.
+// If the refcount increases from zero for that key call iocap_keymngr_init_key.
+static int
+iocap_enabled_tag_inc_refcount(bus_dma_iocap_enabled_tag_t tag,
+		uint8_t nth_key_of_tag)
+{
+	// TODO take a lock on the tag
+	tag->key_refcounts[nth_key_of_tag]++;
+	if (tag->key_refcounts[nth_key_of_tag] == 1) {
+		iocap_keymngr_init_key(tag->iocap_keymngr,
+				tag->allocated_keys[nth_key_of_tag]);
+	}
+	return 0;
+}
+
+// Decremnt the refcount for a key on a given tag.
+// When the refcount hits zero, call iocap_keymngr_clear_key to clear the key data but keep the key index allocated.
+static int
+iocap_enabled_tag_dec_refcount(bus_dma_iocap_enabled_tag_t tag,
+		uint8_t nth_key_of_tag)
+{
+	// TODO take a lock on the tag
+	tag->key_refcounts[nth_key_of_tag]--;
+	if (tag->key_refcounts[nth_key_of_tag] == 0) {
+		iocap_keymngr_clear_key(tag->iocap_keymngr,
+				tag->allocated_keys[nth_key_of_tag]);
+	}
+	return 0;
+}
+
 
 static int
 iocap_keymngr_probe(device_t dev)
@@ -257,7 +279,8 @@ iocap_keymngr_probe(device_t dev)
 static int
 iocap_keymngr_attach(device_t dev)
 {
- 	device_printf(dev, "w00t attached to iocap!!! parent: %p\n", device_get_parent(dev));
+	device_printf(dev, "w00t attached to iocap!!! parent: %p\n",
+			device_get_parent(dev));
 
 	struct iocap_keymngr_softc *sc;
 	// phandle_t node;
@@ -283,7 +306,7 @@ iocap_keymngr_attach(device_t dev)
 	sc->sc_rrid = 0;
 	sc->sc_rtype = SYS_RES_MEMORY;
 	sc->sc_rres = bus_alloc_resource_any(dev, sc->sc_rtype, &sc->sc_rrid,
-	    RF_ACTIVE);
+			RF_ACTIVE);
 	if (sc->sc_rres == NULL) {
 		device_printf(dev, "could not allocate resource\n");
 		error = ENXIO;
@@ -295,13 +318,13 @@ iocap_keymngr_attach(device_t dev)
 
 	sc->base_refinable_tag.common.impl = &bus_dma_iocap_refinable_tag_impl;
 	sc->base_refinable_tag.iocap_keymngr = dev;
-	sc->base_refinable_tag.wrapper_ptr_to_base_tag = bus_get_dma_tag(dev);
+	sc->base_refinable_tag.base_tag = bus_get_dma_tag(dev);
 
 	iocap_keymngr_dbg_perfcounters(dev);
 
 	// TODO setup lock
 
-	fail:
+fail:
 	if (error) {
 		iocap_keymngr_detach(dev);
 		return (error);
@@ -335,105 +358,205 @@ iocap_keymngr_detach(device_t dev)
 	return err;
 }
 
-static void iocap_keymngr_dbg_perfcounters(device_t dev)
+static void
+iocap_keymngr_dbg_perfcounters(device_t dev)
 {
 	struct iocap_keymngr_softc *sc;
 
 	sc = device_get_softc(dev);
 
 	// device_printf(dev, "iocap_keymngr_dbg_perfcounters bst %p bsh %zu bsz %zu\n", sc->bst, (size_t)sc->bsh, (size_t)sc->bsz);
-	uint64_t good_read  = bus_space_read_8(sc->bst, sc->bsh, 0x1000);
+	uint64_t good_read = bus_space_read_8(sc->bst, sc->bsh, 0x1000);
 	// device_printf(dev, "iocap_keymngr_dbg_perfcounters good_read\n");
-	uint64_t bad_read   = bus_space_read_8(sc->bst, sc->bsh, 0x1008);
+	uint64_t bad_read = bus_space_read_8(sc->bst, sc->bsh, 0x1008);
 	// device_printf(dev, "iocap_keymngr_dbg_perfcounters bad_read\n");
 	uint64_t good_write = bus_space_read_8(sc->bst, sc->bsh, 0x1010);
 	// device_printf(dev, "iocap_keymngr_dbg_perfcounters good_write\n");
-	uint64_t bad_write  = bus_space_read_8(sc->bst, sc->bsh, 0x1018);
-	device_printf(dev, "perf counters: %ld %ld %ld %ld\n", good_read, bad_read, good_write, bad_write);
+	uint64_t bad_write = bus_space_read_8(sc->bst, sc->bsh, 0x1018);
+	device_printf(dev, "perf counters: %ld %ld %ld %ld\n", good_read,
+			bad_read, good_write, bad_write);
 }
 
-static int refinable_tag_create(bus_dma_tag_t parent,
+static int
+refinable_tag_create(bus_dma_tag_t parent,
 		bus_size_t alignment, bus_addr_t boundary, bus_addr_t lowaddr,
 		bus_addr_t highaddr, bus_size_t maxsize, int nsegments,
 		bus_size_t maxsegsz, int flags, bus_dma_lock_t *lockfunc,
-		void *lockfuncarg, bus_dma_tag_t *dmat) {
+		void *lockfuncarg, bus_dma_tag_t *dmat)
+{
 	// TODO return a refinable tag not the default one?
-	struct bus_dma_iocap_refinable_tag* refine_parent = (struct bus_dma_iocap_refinable_tag*)parent;
-	struct bus_dma_impl* parent_base_impl = ((struct bus_dma_tag_common*)refine_parent->wrapper_ptr_to_base_tag)->impl;
+	struct bus_dma_iocap_refinable_tag *refine_parent;
+	struct bus_dma_impl *parent_base_impl;
+
+	refine_parent = (struct bus_dma_iocap_refinable_tag *)parent;
+	parent_base_impl = ((struct bus_dma_tag_common *)refine_parent->
+		base_tag)->impl;
+
 	return parent_base_impl->tag_create(
-		refine_parent->wrapper_ptr_to_base_tag, alignment, boundary, lowaddr, highaddr, maxsize, nsegments, maxsegsz, flags, lockfunc, lockfuncarg, dmat
-	);
+			refine_parent->base_tag, alignment, boundary, lowaddr,
+			highaddr, maxsize, nsegments, maxsegsz, flags, lockfunc,
+			lockfuncarg, dmat
+			);
 }
-static int refinable_tag_destroy(bus_dma_tag_t dmat) {
-	struct bus_dma_iocap_refinable_tag* refine_dmat = (struct bus_dma_iocap_refinable_tag*)dmat;
-	struct bus_dma_impl* base_impl = ((struct bus_dma_tag_common*)refine_dmat->wrapper_ptr_to_base_tag)->impl;
-	return base_impl->tag_destroy(refine_dmat->wrapper_ptr_to_base_tag);
+
+static int
+refinable_tag_destroy(bus_dma_tag_t dmat)
+{
+	struct bus_dma_iocap_refinable_tag *refine_dmat;
+	struct bus_dma_impl *base_impl;
+
+	refine_dmat = (struct bus_dma_iocap_refinable_tag *)dmat;
+	base_impl = ((struct bus_dma_tag_common *)refine_dmat->base_tag)->impl;
+
+	return base_impl->tag_destroy(refine_dmat->base_tag);
 }
-static int refinable_map_create(bus_dma_tag_t dmat, int flags, bus_dmamap_t *mapp) {
-	struct bus_dma_iocap_refinable_tag* refine_dmat = (struct bus_dma_iocap_refinable_tag*)dmat;
-	struct bus_dma_impl* base_impl = ((struct bus_dma_tag_common*)refine_dmat->wrapper_ptr_to_base_tag)->impl;
-	return base_impl->map_create(refine_dmat->wrapper_ptr_to_base_tag, flags, mapp);
+
+static int
+refinable_map_create(bus_dma_tag_t dmat, int flags, bus_dmamap_t *mapp)
+{
+	struct bus_dma_iocap_refinable_tag *refine_dmat;
+	struct bus_dma_impl *base_impl;
+
+	refine_dmat = (struct bus_dma_iocap_refinable_tag *)dmat;
+	base_impl = ((struct bus_dma_tag_common *)refine_dmat->base_tag)->impl;
+
+	return base_impl->map_create(refine_dmat->base_tag, flags, mapp);
 }
-static int refinable_map_destroy(bus_dma_tag_t dmat, bus_dmamap_t map) {
-	struct bus_dma_iocap_refinable_tag* refine_dmat = (struct bus_dma_iocap_refinable_tag*)dmat;
-	struct bus_dma_impl* base_impl = ((struct bus_dma_tag_common*)refine_dmat->wrapper_ptr_to_base_tag)->impl;
-	return base_impl->map_destroy(refine_dmat->wrapper_ptr_to_base_tag, map);
+
+static int
+refinable_map_destroy(bus_dma_tag_t dmat, bus_dmamap_t map)
+{
+	struct bus_dma_iocap_refinable_tag *refine_dmat;
+	struct bus_dma_impl *base_impl;
+
+	refine_dmat = (struct bus_dma_iocap_refinable_tag *)dmat;
+	base_impl = ((struct bus_dma_tag_common *)refine_dmat->base_tag)->impl;
+
+	return base_impl->map_destroy(refine_dmat->base_tag, map);
 }
-static int refinable_mem_alloc(bus_dma_tag_t dmat, void** vaddr, int flags,
-bus_dmamap_t *mapp) {
-	struct bus_dma_iocap_refinable_tag* refine_dmat = (struct bus_dma_iocap_refinable_tag*)dmat;
-	struct bus_dma_impl* base_impl = ((struct bus_dma_tag_common*)refine_dmat->wrapper_ptr_to_base_tag)->impl;
-	return base_impl->mem_alloc(refine_dmat->wrapper_ptr_to_base_tag, vaddr, flags, mapp);
+
+static int
+refinable_mem_alloc(bus_dma_tag_t dmat, void **vaddr, int flags,
+		bus_dmamap_t *mapp)
+{
+	struct bus_dma_iocap_refinable_tag *refine_dmat;
+	struct bus_dma_impl *base_impl;
+
+	refine_dmat = (struct bus_dma_iocap_refinable_tag *)dmat;
+	base_impl = ((struct bus_dma_tag_common *)refine_dmat->base_tag)->impl;
+
+	return base_impl->mem_alloc(refine_dmat->base_tag, vaddr, flags, mapp);
 }
-static void refinable_mem_free(bus_dma_tag_t dmat, void *vaddr, bus_dmamap_t map) {
-	struct bus_dma_iocap_refinable_tag* refine_dmat = (struct bus_dma_iocap_refinable_tag*)dmat;
-	struct bus_dma_impl* base_impl = ((struct bus_dma_tag_common*)refine_dmat->wrapper_ptr_to_base_tag)->impl;
-	return base_impl->mem_free(refine_dmat->wrapper_ptr_to_base_tag, vaddr, map);
+
+static void
+refinable_mem_free(bus_dma_tag_t dmat, void *vaddr, bus_dmamap_t map)
+{
+	struct bus_dma_iocap_refinable_tag *refine_dmat;
+	struct bus_dma_impl *base_impl;
+
+	refine_dmat = (struct bus_dma_iocap_refinable_tag *)dmat;
+	base_impl = ((struct bus_dma_tag_common *)refine_dmat->base_tag)->impl;
+
+	return base_impl->mem_free(refine_dmat->base_tag, vaddr, map);
 }
-static int refinable_load_ma(bus_dma_tag_t dmat, bus_dmamap_t map,
-	struct vm_page **ma, bus_size_t tlen, int ma_offs, int flags,
-	bus_dma_segment_t *segs, int *segp) {
-	struct bus_dma_iocap_refinable_tag* refine_dmat = (struct bus_dma_iocap_refinable_tag*)dmat;
-	struct bus_dma_impl* base_impl = ((struct bus_dma_tag_common*)refine_dmat->wrapper_ptr_to_base_tag)->impl;
-	return base_impl->load_ma(refine_dmat->wrapper_ptr_to_base_tag, map, ma, tlen, ma_offs, flags, segs, segp);
+
+static int
+refinable_load_ma(bus_dma_tag_t dmat, bus_dmamap_t map,
+		struct vm_page **ma, bus_size_t tlen, int ma_offs, int flags,
+		bus_dma_segment_t *segs, int *segp)
+{
+	struct bus_dma_iocap_refinable_tag *refine_dmat;
+	struct bus_dma_impl *base_impl;
+
+	refine_dmat = (struct bus_dma_iocap_refinable_tag *)dmat;
+	base_impl = ((struct bus_dma_tag_common *)refine_dmat->base_tag)->impl;
+
+	return base_impl->load_ma(refine_dmat->base_tag, map, ma, tlen, ma_offs,
+			flags, segs, segp);
 }
-static int refinable_load_phys(bus_dma_tag_t dmat, bus_dmamap_t map,
-	vm_paddr_t buf, bus_size_t buflen, int flags,
-	bus_dma_segment_t *segs, int *segp) {
-	struct bus_dma_iocap_refinable_tag* refine_dmat = (struct bus_dma_iocap_refinable_tag*)dmat;
-	struct bus_dma_impl* base_impl = ((struct bus_dma_tag_common*)refine_dmat->wrapper_ptr_to_base_tag)->impl;
-	return base_impl->load_phys(refine_dmat->wrapper_ptr_to_base_tag, map, buf, buflen, flags, segs, segp);
+
+static int
+refinable_load_phys(bus_dma_tag_t dmat, bus_dmamap_t map,
+		vm_paddr_t buf, bus_size_t buflen, int flags,
+		bus_dma_segment_t *segs, int *segp)
+{
+	struct bus_dma_iocap_refinable_tag *refine_dmat;
+	struct bus_dma_impl *base_impl;
+
+	refine_dmat = (struct bus_dma_iocap_refinable_tag *)dmat;
+	base_impl = ((struct bus_dma_tag_common *)refine_dmat->base_tag)->impl;
+
+	return base_impl->load_phys(refine_dmat->base_tag, map, buf, buflen,
+			flags, segs, segp);
 }
-static int refinable_load_buffer(bus_dma_tag_t dmat, bus_dmamap_t map,
-	void *buf, bus_size_t buflen, struct pmap *pmap, int flags,
-	bus_dma_segment_t *segs, int *segp) {
-	struct bus_dma_iocap_refinable_tag* refine_dmat = (struct bus_dma_iocap_refinable_tag*)dmat;
-	struct bus_dma_impl* base_impl = ((struct bus_dma_tag_common*)refine_dmat->wrapper_ptr_to_base_tag)->impl;
-	return base_impl->load_buffer(refine_dmat->wrapper_ptr_to_base_tag, map, buf, buflen, pmap, flags, segs, segp);
+
+static int
+refinable_load_buffer(bus_dma_tag_t dmat, bus_dmamap_t map,
+		void *buf, bus_size_t buflen, struct pmap *pmap, int flags,
+		bus_dma_segment_t *segs, int *segp)
+{
+	struct bus_dma_iocap_refinable_tag *refine_dmat;
+	struct bus_dma_impl *base_impl;
+
+	refine_dmat = (struct bus_dma_iocap_refinable_tag *)dmat;
+	base_impl = ((struct bus_dma_tag_common *)refine_dmat->base_tag)->impl;
+
+	return base_impl->load_buffer(refine_dmat->base_tag, map, buf, buflen,
+			pmap, flags, segs, segp);
 }
-static void refinable_map_waitok(bus_dma_tag_t dmat, bus_dmamap_t map,
-	struct memdesc *mem, bus_dmamap_callback_t *callback,
-	void *callback_arg) {
-	struct bus_dma_iocap_refinable_tag* refine_dmat = (struct bus_dma_iocap_refinable_tag*)dmat;
-	struct bus_dma_impl* base_impl = ((struct bus_dma_tag_common*)refine_dmat->wrapper_ptr_to_base_tag)->impl;
-	base_impl->map_waitok(refine_dmat->wrapper_ptr_to_base_tag, map, mem, callback, callback_arg);
+
+static void
+refinable_map_waitok(bus_dma_tag_t dmat, bus_dmamap_t map,
+		struct memdesc *mem, bus_dmamap_callback_t *callback,
+		void *callback_arg)
+{
+	struct bus_dma_iocap_refinable_tag *refine_dmat;
+	struct bus_dma_impl *base_impl;
+
+	refine_dmat = (struct bus_dma_iocap_refinable_tag *)dmat;
+	base_impl = ((struct bus_dma_tag_common *)refine_dmat->base_tag)->impl;
+
+	base_impl->map_waitok(refine_dmat->base_tag, map, mem, callback,
+			callback_arg);
 }
-static bus_dma_segment_t *refinable_map_complete(bus_dma_tag_t dmat, bus_dmamap_t map,
-bus_dma_segment_t *segs, int nsegs, int error) {
-	struct bus_dma_iocap_refinable_tag* refine_dmat = (struct bus_dma_iocap_refinable_tag*)dmat;
-	struct bus_dma_impl* base_impl = ((struct bus_dma_tag_common*)refine_dmat->wrapper_ptr_to_base_tag)->impl;
-	return base_impl->map_complete(refine_dmat->wrapper_ptr_to_base_tag, map, segs, nsegs, error);
+
+static bus_dma_segment_t *
+refinable_map_complete(bus_dma_tag_t dmat, bus_dmamap_t map,
+		bus_dma_segment_t *segs, int nsegs, int error)
+{
+	struct bus_dma_iocap_refinable_tag *refine_dmat;
+	struct bus_dma_impl *base_impl;
+
+	refine_dmat = (struct bus_dma_iocap_refinable_tag *)dmat;
+	base_impl = ((struct bus_dma_tag_common *)refine_dmat->base_tag)->impl;
+
+	return base_impl->map_complete(refine_dmat->base_tag, map, segs, nsegs,
+			error);
 }
-static void refinable_map_unload(bus_dma_tag_t dmat, bus_dmamap_t map) {
-	struct bus_dma_iocap_refinable_tag* refine_dmat = (struct bus_dma_iocap_refinable_tag*)dmat;
-	struct bus_dma_impl* base_impl = ((struct bus_dma_tag_common*)refine_dmat->wrapper_ptr_to_base_tag)->impl;
-	base_impl->map_unload(refine_dmat->wrapper_ptr_to_base_tag, map);
+
+static void
+refinable_map_unload(bus_dma_tag_t dmat, bus_dmamap_t map)
+{
+	struct bus_dma_iocap_refinable_tag *refine_dmat;
+	struct bus_dma_impl *base_impl;
+
+	refine_dmat = (struct bus_dma_iocap_refinable_tag *)dmat;
+	base_impl = ((struct bus_dma_tag_common *)refine_dmat->base_tag)->impl;
+
+	base_impl->map_unload(refine_dmat->base_tag, map);
 }
-static void refinable_map_sync(bus_dma_tag_t dmat, bus_dmamap_t map,
-bus_dmasync_op_t op) {
-	struct bus_dma_iocap_refinable_tag* refine_dmat = (struct bus_dma_iocap_refinable_tag*)dmat;
-	struct bus_dma_impl* base_impl = ((struct bus_dma_tag_common*)refine_dmat->wrapper_ptr_to_base_tag)->impl;
-	base_impl->map_sync(refine_dmat->wrapper_ptr_to_base_tag, map, op);
+
+static void
+refinable_map_sync(bus_dma_tag_t dmat, bus_dmamap_t map,
+		bus_dmasync_op_t op)
+{
+	struct bus_dma_iocap_refinable_tag *refine_dmat;
+	struct bus_dma_impl *base_impl;
+
+	refine_dmat = (struct bus_dma_iocap_refinable_tag *)dmat;
+	base_impl = ((struct bus_dma_tag_common *)refine_dmat->base_tag)->impl;
+
+	base_impl->map_sync(refine_dmat->base_tag, map, op);
 }
 
 struct bus_dma_impl bus_dma_iocap_refinable_tag_impl = {
@@ -452,12 +575,15 @@ struct bus_dma_impl bus_dma_iocap_refinable_tag_impl = {
 	.map_sync = refinable_map_sync
 };
 
-// malloc-s a struct bus_iocap_dmamap, populating all fields except the wrapper_ptr_to_base_map
+// malloc-s a struct bus_iocap_dmamap, populating all fields except the base_map
 // and incrementing the refcount for the relevent key.
-static bus_iocap_dmamap_t _iocap_enabled_create_map_common(bus_dma_iocap_enabled_tag_t tag) {
+static bus_iocap_dmamap_t
+_iocap_enabled_create_map_common(bus_dma_iocap_enabled_tag_t tag)
+{
 	bus_iocap_dmamap_t map;
 
-	uint8_t nth_key_of_tag = 0; // TODO depending on revocation strategy we should change this
+	uint8_t nth_key_of_tag = 0;
+	// TODO depending on revocation strategy we should change this
 	iocap_enabled_tag_inc_refcount(tag, nth_key_of_tag);
 
 	map = malloc(sizeof(*map), M_IOCAP_DMAMAP, M_NOWAIT | M_ZERO);
@@ -471,9 +597,12 @@ static bus_iocap_dmamap_t _iocap_enabled_create_map_common(bus_dma_iocap_enabled
 	return map;
 }
 
-// free-s a struct bus_iocap_dmamap, assuming the wrapper_ptr_to_base_map has already been freed
+// free-s a struct bus_iocap_dmamap, assuming the base_map has already been freed
 // and decrementing the refcount for the relevant key
-static void _iocap_enabled_destroy_map_common(bus_dma_iocap_enabled_tag_t tag, bus_iocap_dmamap_t map) {
+static void
+_iocap_enabled_destroy_map_common(bus_dma_iocap_enabled_tag_t tag,
+		bus_iocap_dmamap_t map)
+{
 	iocap_enabled_tag_dec_refcount(tag, map->nth_key_of_tag);
 
 	// TODO if we end up putting a lock in each dmamap like IOMMU does, destroy it here
@@ -481,159 +610,271 @@ static void _iocap_enabled_destroy_map_common(bus_dma_iocap_enabled_tag_t tag, b
 	free(map, M_IOCAP_DMAMAP);
 }
 
-static int iocap_enabled_tag_create(bus_dma_tag_t parent,
+static int
+iocap_enabled_tag_create(
+		bus_dma_tag_t parent,
 		bus_size_t alignment, bus_addr_t boundary, bus_addr_t lowaddr,
 		bus_addr_t highaddr, bus_size_t maxsize, int nsegments,
 		bus_size_t maxsegsz, int flags, bus_dma_lock_t *lockfunc,
-		void *lockfuncarg, bus_dma_tag_t *dmat) {
+		void *lockfuncarg, bus_dma_tag_t *dmat)
+{
 	// We do not allow refining iocap_enabled tags,
 	// because then there would be multiple iocap_enabled tags using the same key IDs.
 	// This would make managing those key IDs more complicated.
 	// Right now it's simple, in iocap_enabled_tag_destroy we can free all the key IDs associated with the tag.
 	return EOPNOTSUPP;
 }
-static int iocap_enabled_tag_destroy(bus_dma_tag_t dmat) {
-	struct bus_dma_iocap_enabled_tag* iocap_dmat = (struct bus_dma_iocap_enabled_tag*)dmat;
-	// This implicitly makes all mappings from this tag inaccessible :)
-	iocap_keymngr_free_key_ids(iocap_dmat->iocap_keymngr, iocap_dmat->allocated_keys, iocap_dmat->n_keys);
-	struct bus_dma_impl* base_impl = ((struct bus_dma_tag_common*)iocap_dmat->wrapper_ptr_to_base_tag)->impl;
 
+static int
+iocap_enabled_tag_destroy(bus_dma_tag_t dmat)
+{
+	struct bus_dma_iocap_enabled_tag *iocap_dmat;
+	struct bus_dma_impl *base_impl;
 	int error;
-	error = base_impl->tag_destroy(iocap_dmat->wrapper_ptr_to_base_tag);
+
+	iocap_dmat = (struct bus_dma_iocap_enabled_tag *)dmat;
+	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
+	error = 0;
+
+	// This implicitly makes all mappings from this tag inaccessible :)
+	iocap_keymngr_free_key_ids(iocap_dmat->iocap_keymngr,
+			iocap_dmat->allocated_keys, iocap_dmat->n_keys);
+
+	error = base_impl->tag_destroy(iocap_dmat->base_tag);
 
 	free(iocap_dmat, M_IOCAP_DMAMAP);
 
 	return error;
 }
-static int iocap_enabled_map_create(bus_dma_tag_t dmat, int flags, bus_dmamap_t *mapp) {
-	struct bus_dma_iocap_enabled_tag* iocap_dmat = (struct bus_dma_iocap_enabled_tag*)dmat;
-	struct bus_dma_impl* base_impl = ((struct bus_dma_tag_common*)iocap_dmat->wrapper_ptr_to_base_tag)->impl;
 
-	struct bus_iocap_dmamap *map;
+static int
+iocap_enabled_map_create(bus_dma_tag_t dmat, int flags, bus_dmamap_t *mapp)
+{
+	struct bus_dma_iocap_enabled_tag *iocap_dmat;
+	struct bus_dma_impl *base_impl;
+	struct bus_iocap_dmamap *iocap_map;
+	int error;
 
-	map = _iocap_enabled_create_map_common(iocap_dmat);
+	iocap_dmat = (struct bus_dma_iocap_enabled_tag *)dmat;
+	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
+	iocap_map = _iocap_enabled_create_map_common(iocap_dmat);
+	error = 0;
 
-	int error = 0;
-
-	error = base_impl->map_create(iocap_dmat->wrapper_ptr_to_base_tag, flags, &map->wrapper_ptr_to_base_map);
+	error = base_impl->map_create(iocap_dmat->base_tag, flags,
+			&iocap_map->base_map);
 	if (error) {
+		_iocap_enabled_destroy_map_common(iocap_dmat, iocap_map);
 		return error;
 	}
 
-	*mapp = (bus_dmamap_t)map;
+	*mapp = (bus_dmamap_t)iocap_map;
 
 	return 0;
 }
-static int iocap_enabled_map_destroy(bus_dma_tag_t dmat, bus_dmamap_t map) {
-	struct bus_dma_iocap_enabled_tag* iocap_dmat = (struct bus_dma_iocap_enabled_tag*)dmat;
-	struct bus_dma_impl* base_impl = ((struct bus_dma_tag_common*)iocap_dmat->wrapper_ptr_to_base_tag)->impl;
-	struct bus_iocap_dmamap* iocap_map = (struct bus_iocap_dmamap*)map;
 
+static int
+iocap_enabled_map_destroy(bus_dma_tag_t dmat, bus_dmamap_t map)
+{
+	struct bus_dma_iocap_enabled_tag *iocap_dmat;
+	struct bus_dma_impl *base_impl;
+	struct bus_iocap_dmamap *iocap_map;
 	int error;
-	error = base_impl->map_destroy(iocap_dmat->wrapper_ptr_to_base_tag, iocap_map->wrapper_ptr_to_base_map);
+
+	iocap_dmat = (struct bus_dma_iocap_enabled_tag *)dmat;
+	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
+	iocap_map = (struct bus_iocap_dmamap *)map;
+
+	error = base_impl->map_destroy(iocap_dmat->base_tag,
+			iocap_map->base_map);
 
 	_iocap_enabled_destroy_map_common(iocap_dmat, iocap_map);
 
 	return error;
 }
-static int iocap_enabled_mem_alloc(bus_dma_tag_t dmat, void** vaddr, int flags,
-bus_dmamap_t *mapp) {
-	struct bus_dma_iocap_enabled_tag* iocap_dmat = (struct bus_dma_iocap_enabled_tag*)dmat;
-	struct bus_dma_impl* base_impl = ((struct bus_dma_tag_common*)iocap_dmat->wrapper_ptr_to_base_tag)->impl;
 
-	struct bus_iocap_dmamap *map;
+static int
+iocap_enabled_mem_alloc(bus_dma_tag_t dmat, void **vaddr, int flags,
+		bus_dmamap_t *mapp)
+{
+	struct bus_dma_iocap_enabled_tag *iocap_dmat;
+	struct bus_dma_impl *base_impl;
+	struct bus_iocap_dmamap *iocap_map;
 
-	map = _iocap_enabled_create_map_common(iocap_dmat);
+	iocap_dmat = (struct bus_dma_iocap_enabled_tag *)dmat;
+	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
+	iocap_map = _iocap_enabled_create_map_common(iocap_dmat);
 
 	int error = 0;
 
-	// use base_impl to allocate the memory and fill in the wrapper_ptr_to_base_map
-	error = base_impl->mem_alloc(iocap_dmat->wrapper_ptr_to_base_tag, vaddr, flags, &map->wrapper_ptr_to_base_map);
+	// use base_impl to allocate the memory and fill in the base_map
+	error = base_impl->mem_alloc(iocap_dmat->base_tag, vaddr, flags,
+			&iocap_map->base_map);
 	if (error) {
 		return error;
 	}
 
-	*mapp = (bus_dmamap_t)map;
+	*mapp = (bus_dmamap_t)iocap_map;
 
 	return 0;
 }
-static void iocap_enabled_mem_free(bus_dma_tag_t dmat, void *vaddr, bus_dmamap_t map) {
-	// struct bus_dma_iocap_enabled_tag* iocap_dmat = (struct bus_dma_iocap_enabled_tag*)dmat;
-	// struct bus_dma_impl* base_impl = ((struct bus_dma_tag_common*)iocap_dmat->wrapper_ptr_to_base_tag)->impl;
-	// return base_impl->mem_free(iocap_dmat->wrapper_ptr_to_base_tag, vaddr, map);
-	struct bus_dma_iocap_enabled_tag* iocap_dmat = (struct bus_dma_iocap_enabled_tag*)dmat;
-	struct bus_dma_impl* base_impl = ((struct bus_dma_tag_common*)iocap_dmat->wrapper_ptr_to_base_tag)->impl;
-	struct bus_iocap_dmamap* iocap_map = (struct bus_iocap_dmamap*)map;
+
+static void
+iocap_enabled_mem_free(bus_dma_tag_t dmat, void *vaddr, bus_dmamap_t map)
+{
+	struct bus_dma_iocap_enabled_tag *iocap_dmat;
+	struct bus_dma_impl *base_impl;
+	struct bus_iocap_dmamap *iocap_map;
+
+	iocap_dmat = (struct bus_dma_iocap_enabled_tag *)dmat;
+	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
+	iocap_map = (struct bus_iocap_dmamap *)map;
 
 	// Use base_impl to free the memory it allocated in mem_alloc
-	base_impl->mem_free(iocap_dmat->wrapper_ptr_to_base_tag, vaddr, iocap_map->wrapper_ptr_to_base_map);
+	base_impl->mem_free(iocap_dmat->base_tag, vaddr, iocap_map->base_map);
 
 	// do the rest of the IOCap-specific destruction
 	_iocap_enabled_destroy_map_common(iocap_dmat, iocap_map);
 }
-static int iocap_enabled_load_ma(bus_dma_tag_t dmat, bus_dmamap_t map,
-	struct vm_page **ma, bus_size_t tlen, int ma_offs, int flags,
-	bus_dma_segment_t *segs, int *segp) {
-	struct bus_iocap_dmamap* iocap_map = (struct bus_iocap_dmamap*)map;
-	KASSERT(iocap_map->state != iocap_dmamap_loaded, ("Tried to load more entries into a DMA map after it was completed"));
+
+static int
+iocap_enabled_load_ma(bus_dma_tag_t dmat, bus_dmamap_t map,
+		struct vm_page **ma, bus_size_t tlen, int ma_offs, int flags,
+		bus_dma_segment_t *segs, int *segp)
+{
+	struct bus_dma_iocap_enabled_tag *iocap_dmat;
+	struct bus_dma_impl *base_impl;
+	struct bus_iocap_dmamap *iocap_map;
+
+	iocap_dmat = (struct bus_dma_iocap_enabled_tag *)dmat;
+	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
+	iocap_map = (struct bus_iocap_dmamap *)map;
+
+	KASSERT(iocap_map->state != iocap_dmamap_loaded,
+	("Tried to load more entries into a DMA map after it was completed"
+	));
 	iocap_map->state = iocap_dmamap_loading;
-	struct bus_dma_iocap_enabled_tag* iocap_dmat = (struct bus_dma_iocap_enabled_tag*)dmat;
-	struct bus_dma_impl* base_impl = ((struct bus_dma_tag_common*)iocap_dmat->wrapper_ptr_to_base_tag)->impl;
-	return base_impl->load_ma(iocap_dmat->wrapper_ptr_to_base_tag, iocap_map->wrapper_ptr_to_base_map, ma, tlen, ma_offs, flags, segs, segp);
+
+	return base_impl->load_ma(iocap_dmat->base_tag, iocap_map->base_map, ma,
+			tlen, ma_offs, flags, segs, segp);
 }
-static int iocap_enabled_load_phys(bus_dma_tag_t dmat, bus_dmamap_t map,
-	vm_paddr_t buf, bus_size_t buflen, int flags,
-	bus_dma_segment_t *segs, int *segp) {
-	struct bus_iocap_dmamap* iocap_map = (struct bus_iocap_dmamap*)map;
-	KASSERT(iocap_map->state != iocap_dmamap_loaded, ("Tried to load more entries into a DMA map after it was completed"));
+
+static int
+iocap_enabled_load_phys(bus_dma_tag_t dmat, bus_dmamap_t map,
+		vm_paddr_t buf, bus_size_t buflen, int flags,
+		bus_dma_segment_t *segs, int *segp)
+{
+	struct bus_dma_iocap_enabled_tag *iocap_dmat;
+	struct bus_dma_impl *base_impl;
+	struct bus_iocap_dmamap *iocap_map;
+
+	iocap_dmat = (struct bus_dma_iocap_enabled_tag *)dmat;
+	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
+	iocap_map = (struct bus_iocap_dmamap *)map;
+
+	KASSERT(iocap_map->state != iocap_dmamap_loaded,
+	("Tried to load more entries into a DMA map after it was completed"
+	));
 	iocap_map->state = iocap_dmamap_loading;
-	struct bus_dma_iocap_enabled_tag* iocap_dmat = (struct bus_dma_iocap_enabled_tag*)dmat;
-	struct bus_dma_impl* base_impl = ((struct bus_dma_tag_common*)iocap_dmat->wrapper_ptr_to_base_tag)->impl;
-	return base_impl->load_phys(iocap_dmat->wrapper_ptr_to_base_tag, iocap_map->wrapper_ptr_to_base_map, buf, buflen, flags, segs, segp);
+
+	return base_impl->load_phys(iocap_dmat->base_tag, iocap_map->base_map,
+			buf, buflen, flags, segs, segp);
 }
-static int iocap_enabled_load_buffer(bus_dma_tag_t dmat, bus_dmamap_t map,
-	void *buf, bus_size_t buflen, struct pmap *pmap, int flags,
-	bus_dma_segment_t *segs, int *segp) {
-	struct bus_iocap_dmamap* iocap_map = (struct bus_iocap_dmamap*)map;
-	KASSERT(iocap_map->state != iocap_dmamap_loaded, ("Tried to load more entries into a DMA map after it was completed"));
+
+static int
+iocap_enabled_load_buffer(bus_dma_tag_t dmat, bus_dmamap_t map,
+		void *buf, bus_size_t buflen, struct pmap *pmap, int flags,
+		bus_dma_segment_t *segs, int *segp)
+{
+	struct bus_dma_iocap_enabled_tag *iocap_dmat;
+	struct bus_dma_impl *base_impl;
+	struct bus_iocap_dmamap *iocap_map;
+
+	iocap_dmat = (struct bus_dma_iocap_enabled_tag *)dmat;
+	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
+	iocap_map = (struct bus_iocap_dmamap *)map;
+
+	KASSERT(iocap_map->state != iocap_dmamap_loaded,
+	("Tried to load more entries into a DMA map after it was completed"
+	));
 	iocap_map->state = iocap_dmamap_loading;
-	struct bus_dma_iocap_enabled_tag* iocap_dmat = (struct bus_dma_iocap_enabled_tag*)dmat;
-	struct bus_dma_impl* base_impl = ((struct bus_dma_tag_common*)iocap_dmat->wrapper_ptr_to_base_tag)->impl;
-	return base_impl->load_buffer(iocap_dmat->wrapper_ptr_to_base_tag, iocap_map->wrapper_ptr_to_base_map, buf, buflen, pmap, flags, segs, segp);
+
+	return base_impl->load_buffer(iocap_dmat->base_tag, iocap_map->base_map,
+			buf, buflen, pmap, flags, segs, segp);
 }
-static void iocap_enabled_map_waitok(bus_dma_tag_t dmat, bus_dmamap_t map,
-	struct memdesc *mem, bus_dmamap_callback_t *callback,
-	void *callback_arg) {
-	struct bus_iocap_dmamap* iocap_map = (struct bus_iocap_dmamap*)map;
-	KASSERT(iocap_map->state != iocap_dmamap_loaded, ("Tried to waitok on a DMA map after it was completed"));
+
+static void
+iocap_enabled_map_waitok(bus_dma_tag_t dmat, bus_dmamap_t map,
+		struct memdesc *mem, bus_dmamap_callback_t *callback,
+		void *callback_arg)
+{
+	struct bus_dma_iocap_enabled_tag *iocap_dmat;
+	struct bus_dma_impl *base_impl;
+	struct bus_iocap_dmamap *iocap_map;
+
+	iocap_dmat = (struct bus_dma_iocap_enabled_tag *)dmat;
+	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
+	iocap_map = (struct bus_iocap_dmamap *)map;
+
+	KASSERT(iocap_map->state != iocap_dmamap_loaded,
+			("Tried to waitok on a DMA map after it was completed"))
+	;
 	iocap_map->state = iocap_dmamap_loading;
-	struct bus_dma_iocap_enabled_tag* iocap_dmat = (struct bus_dma_iocap_enabled_tag*)dmat;
-	struct bus_dma_impl* base_impl = ((struct bus_dma_tag_common*)iocap_dmat->wrapper_ptr_to_base_tag)->impl;
-	base_impl->map_waitok(iocap_dmat->wrapper_ptr_to_base_tag, iocap_map->wrapper_ptr_to_base_map, mem, callback, callback_arg);
+
+	base_impl->map_waitok(iocap_dmat->base_tag, iocap_map->base_map, mem,
+			callback, callback_arg);
 }
-static bus_dma_segment_t *iocap_enabled_map_complete(bus_dma_tag_t dmat, bus_dmamap_t map,
-bus_dma_segment_t *segs, int nsegs, int error) {
-	struct bus_iocap_dmamap* iocap_map = (struct bus_iocap_dmamap*)map;
-	KASSERT(iocap_map->state != iocap_dmamap_loaded, ("Tried to complete a DMA map after it was completed"));
+
+static bus_dma_segment_t *
+iocap_enabled_map_complete(bus_dma_tag_t dmat, bus_dmamap_t map,
+		bus_dma_segment_t *segs, int nsegs, int error)
+{
+	struct bus_dma_iocap_enabled_tag *iocap_dmat;
+	struct bus_dma_impl *base_impl;
+	struct bus_iocap_dmamap *iocap_map;
+
+	iocap_dmat = (struct bus_dma_iocap_enabled_tag *)dmat;
+	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
+	iocap_map = (struct bus_iocap_dmamap *)map;
+
+	KASSERT(iocap_map->state != iocap_dmamap_loaded,
+			("Tried to complete a DMA map after it was completed"));
 	iocap_map->state = iocap_dmamap_loaded;
-	struct bus_dma_iocap_enabled_tag* iocap_dmat = (struct bus_dma_iocap_enabled_tag*)dmat;
-	struct bus_dma_impl* base_impl = ((struct bus_dma_tag_common*)iocap_dmat->wrapper_ptr_to_base_tag)->impl;
-	return base_impl->map_complete(iocap_dmat->wrapper_ptr_to_base_tag, iocap_map->wrapper_ptr_to_base_map, segs, nsegs, error);
+
+	return base_impl->map_complete(iocap_dmat->base_tag,
+			iocap_map->base_map, segs, nsegs, error);
 }
-static void iocap_enabled_map_unload(bus_dma_tag_t dmat, bus_dmamap_t map) {
-	struct bus_iocap_dmamap* iocap_map = (struct bus_iocap_dmamap*)map;
-	KASSERT(iocap_map->state == iocap_dmamap_loaded, ("Tried to unload a DMA map when it was not loaded"));
+
+static void
+iocap_enabled_map_unload(bus_dma_tag_t dmat, bus_dmamap_t map)
+{
+	struct bus_dma_iocap_enabled_tag *iocap_dmat;
+	struct bus_dma_impl *base_impl;
+	struct bus_iocap_dmamap *iocap_map;
+
+	iocap_dmat = (struct bus_dma_iocap_enabled_tag *)dmat;
+	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
+	iocap_map = (struct bus_iocap_dmamap *)map;
+
+	KASSERT(iocap_map->state == iocap_dmamap_loaded,
+			("Tried to unload a DMA map when it was not loaded"));
 	iocap_map->state = iocap_dmamap_unloaded;
-	struct bus_dma_iocap_enabled_tag* iocap_dmat = (struct bus_dma_iocap_enabled_tag*)dmat;
-	struct bus_dma_impl* base_impl = ((struct bus_dma_tag_common*)iocap_dmat->wrapper_ptr_to_base_tag)->impl;
-	base_impl->map_unload(iocap_dmat->wrapper_ptr_to_base_tag, iocap_map->wrapper_ptr_to_base_map);
+
+	base_impl->map_unload(iocap_dmat->base_tag, iocap_map->base_map);
 }
-static void iocap_enabled_map_sync(bus_dma_tag_t dmat, bus_dmamap_t map,
-bus_dmasync_op_t op) {
-	struct bus_iocap_dmamap* iocap_map = (struct bus_iocap_dmamap*)map;
-	struct bus_dma_iocap_enabled_tag* iocap_dmat = (struct bus_dma_iocap_enabled_tag*)dmat;
-	struct bus_dma_impl* base_impl = ((struct bus_dma_tag_common*)iocap_dmat->wrapper_ptr_to_base_tag)->impl;
-	base_impl->map_sync(iocap_dmat->wrapper_ptr_to_base_tag, iocap_map->wrapper_ptr_to_base_map, op);
+
+static void
+iocap_enabled_map_sync(bus_dma_tag_t dmat, bus_dmamap_t map,
+		bus_dmasync_op_t op)
+{
+	struct bus_dma_iocap_enabled_tag *iocap_dmat;
+	struct bus_dma_impl *base_impl;
+	struct bus_iocap_dmamap *iocap_map;
+
+	iocap_dmat = (struct bus_dma_iocap_enabled_tag *)dmat;
+	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
+	iocap_map = (struct bus_iocap_dmamap *)map;
+
+	base_impl->map_sync(iocap_dmat->base_tag, iocap_map->base_map, op);
 }
 
 struct bus_dma_impl bus_dma_iocap_enabled_tag_impl = {
@@ -650,9 +891,11 @@ struct bus_dma_impl bus_dma_iocap_enabled_tag_impl = {
 	.map_complete = iocap_enabled_map_complete,
 	.map_unload = iocap_enabled_map_unload,
 	.map_sync = iocap_enabled_map_sync
-}; 
+};
 
-static bus_dma_tag_t iocap_keymngr_get_dma_tag(device_t dev, device_t child) {
+static bus_dma_tag_t
+iocap_keymngr_get_dma_tag(device_t dev, device_t child)
+{
 	struct iocap_keymngr_softc *sc;
 
 	sc = device_get_softc(dev);
@@ -660,41 +903,51 @@ static bus_dma_tag_t iocap_keymngr_get_dma_tag(device_t dev, device_t child) {
 	return (bus_dma_tag_t)&sc->base_refinable_tag;
 }
 
-bus_dma_iocap_refinable_tag_t bus_dma_tag_iocap_refinable(bus_dma_tag_t tag) {
-	if (((struct bus_dma_tag_common*)tag)->impl == &bus_dma_iocap_refinable_tag_impl) {
+bus_dma_iocap_refinable_tag_t
+bus_dma_tag_iocap_refinable(bus_dma_tag_t tag)
+{
+	if (((struct bus_dma_tag_common *)tag)->impl == &
+		bus_dma_iocap_refinable_tag_impl) {
 		return (bus_dma_iocap_refinable_tag_t)tag;
 	}
 	return 0;
 }
 
-int bus_dma_tag_refine_to_iocap_group(bus_dma_iocap_refinable_tag_t tag, struct iocap_keymngr_revocation_params params, bus_dma_iocap_enabled_tag_t* out) {
+int
+bus_dma_tag_refine_to_iocap_group(bus_dma_iocap_refinable_tag_t tag,
+		struct iocap_keymngr_revocation_params params,
+		bus_dma_iocap_enabled_tag_t *out)
+{
 	if (!bus_dma_tag_iocap_refinable((bus_dma_tag_t)tag)) {
 		return EPERM;
 	}
 
 	switch (params.mode) {
-		case iocap_revoke_when_no_mappings_unsafe: {
-			if (params.n_keys != 1) {
-				return EINVAL;
-			}
-			break;
-		}
-		default:
+	case iocap_revoke_when_no_mappings_unsafe: {
+		if (params.n_keys != 1) {
 			return EINVAL;
+		}
+		break;
+	}
+	default:
+		return EINVAL;
 	}
 
 	if (params.n_keys > MAX_NUM_KEYS_PER_TAG) {
 		return EINVAL;
 	}
 
-	struct bus_dma_iocap_enabled_tag* new_tag = malloc(sizeof(struct bus_dma_iocap_enabled_tag), M_IOCAP_DMAMAP, M_ZERO | M_NOWAIT);
+	struct bus_dma_iocap_enabled_tag *new_tag = malloc(
+			sizeof(struct bus_dma_iocap_enabled_tag),
+			M_IOCAP_DMAMAP, M_ZERO | M_NOWAIT);
 
 	new_tag->common.impl = &bus_dma_iocap_enabled_tag_impl;
-	new_tag->wrapper_ptr_to_base_tag = tag->wrapper_ptr_to_base_tag;
+	new_tag->base_tag = tag->base_tag;
 	new_tag->revocation_mode = params.mode;
 	new_tag->n_keys = params.n_keys;
 
-	int error = iocap_keymngr_alloc_key_ids(tag->iocap_keymngr, new_tag->allocated_keys, params.n_keys);
+	int error = iocap_keymngr_alloc_key_ids(tag->iocap_keymngr,
+			new_tag->allocated_keys, params.n_keys);
 	if (error) {
 		return error;
 	}
@@ -707,7 +960,9 @@ int bus_dma_tag_refine_to_iocap_group(bus_dma_iocap_refinable_tag_t tag, struct 
 // Return 1 if the given bus_dmamap_t is an IOCap-able map - i.e. whether you can call bus_dmamap_mint_iocap
 // or bus_dmamap_mint_virtio_iocap on it.
 // Otherwise returns 0.
-bus_iocap_dmamap_t bus_dmamap_can_mint_iocap(bus_dmamap_t map) {
+bus_iocap_dmamap_t
+bus_dmamap_can_mint_iocap(bus_dmamap_t map)
+{
 	if (((bus_iocap_dmamap_t)map)->magic == BUS_IOCAP_DMAMAP_MAGIC) {
 		return (bus_iocap_dmamap_t)map;
 	}
@@ -721,31 +976,35 @@ bus_iocap_dmamap_t bus_dmamap_can_mint_iocap(bus_dmamap_t map) {
 // Returns 0 if successful,
 // EPERM if the map is not usable for minting,
 // and EDOM if ccap2024_11_init_cavs_exact fails.
-int bus_dmamap_mint_iocap(bus_iocap_dmamap_t map, bus_dma_segment_t* segment, CCapPerms perms, struct iocap* out) {
+int
+bus_dmamap_mint_iocap(bus_iocap_dmamap_t map, bus_dma_segment_t *segment,
+		CCapPerms perms, struct iocap *out)
+{
 	if (!bus_dmamap_can_mint_iocap((bus_dmamap_t)map)) {
 		return EPERM;
 	}
 
 	uint8_t key_id;
-	CCapU128* key;
+	CCapU128 *key;
 
 	key_id = map->tag->allocated_keys[map->nth_key_of_tag];
 	key = iocap_keymngr_get_and_lock_key(map->tag->iocap_keymngr, key_id);
 
 	CCapResult res = ccap2024_11_init_cavs_exact(
-		&out->cap,
-		key,
-		segment->ds_addr,
-		segment->ds_len,
-		key_id,
-		perms);
+			&out->cap,
+			key,
+			segment->ds_addr,
+			segment->ds_len,
+			key_id,
+			perms);
 
 	iocap_keymngr_unlock_key(map->tag->iocap_keymngr, key_id);
 
 	if (res != CCapResult_Success) {
 		device_printf(map->tag->iocap_keymngr,
-			    "failed to mint iocap for %lx..%lx with key #%d perms %s: %s\n",
-			    segment->ds_addr, segment->ds_len, key_id, ccap_perms_str(perms), ccap_result_str(res));
+				"failed to mint iocap for %lx..%lx with key #%d perms %s: %s\n",
+				segment->ds_addr, segment->ds_len, key_id,
+				ccap_perms_str(perms), ccap_result_str(res));
 		return EDOM;
 	}
 
@@ -761,7 +1020,10 @@ int bus_dmamap_mint_iocap(bus_iocap_dmamap_t map, bus_dma_segment_t* segment, CC
 // Returns 0 if successful,
 // EPERM if the map is not usable for minting,
 // and EDOM if ccap2024_11_init_virtio_cavs_exact fails or if the segment length >4GiB
-int bus_dmamap_mint_virtio_iocap(bus_iocap_dmamap_t map, bus_dma_segment_t* segment, uint16_t flags, uint16_t next, struct iocap* out) {
+int
+bus_dmamap_mint_virtio_iocap(bus_iocap_dmamap_t map, bus_dma_segment_t *segment,
+		uint16_t flags, uint16_t next, struct iocap *out)
+{
 	if (!bus_dmamap_can_mint_iocap((bus_dmamap_t)map)) {
 		return EPERM;
 	}
@@ -771,7 +1033,7 @@ int bus_dmamap_mint_virtio_iocap(bus_iocap_dmamap_t map, bus_dma_segment_t* segm
 	}
 
 	uint8_t key_id;
-	CCapU128* key;
+	CCapU128 *key;
 
 	key_id = map->tag->allocated_keys[map->nth_key_of_tag];
 	key = iocap_keymngr_get_and_lock_key(map->tag->iocap_keymngr, key_id);
@@ -784,17 +1046,18 @@ int bus_dmamap_mint_virtio_iocap(bus_iocap_dmamap_t map, bus_dma_segment_t* segm
 	};
 
 	CCapResult res = ccap2024_11_init_virtio_cavs_exact(
-		&out->cap,
-		key,
-		&desc,
-		key_id);
+			&out->cap,
+			key,
+			&desc,
+			key_id);
 
 	iocap_keymngr_unlock_key(map->tag->iocap_keymngr, key_id);
 
 	if (res != CCapResult_Success) {
 		device_printf(map->tag->iocap_keymngr,
 				"failed to mint virtio iocap for %lx..%lx with key #%d flags %x next %d: %s\n",
-				segment->ds_addr, segment->ds_len, key_id, flags, next, ccap_result_str(res));
+				segment->ds_addr, segment->ds_len, key_id,
+				flags, next, ccap_result_str(res));
 		return EDOM;
 	}
 
