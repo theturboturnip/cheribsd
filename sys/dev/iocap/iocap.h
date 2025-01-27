@@ -5,4 +5,8 @@
 #include <sys/types.h>
 #include "libccap/libccap.h"
 
+struct iocap {
+    CCap2024_11 cap;
+};
+
 #endif
