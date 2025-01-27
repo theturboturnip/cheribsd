@@ -181,6 +181,8 @@ struct iocap_keymngr_softc {
 
 	struct bus_dma_iocap_refinable_tag base_refinable_tag;
 
+	uint32_t available_keys;
+	uint8_t last_allocated_key;
 	struct iocap_key_state keys[256];
 };
 
@@ -217,7 +219,6 @@ static void iocap_keymngr_init_key(device_t, uint8_t key_id);
 // and takes the lock on the key so it doesn't change while minting.
 // Return NULL if not inited, and still takes the lock in this case.
 // Must call iocap_keymngr_unlock_key() after using the key to release it to others.
-// TODO figure out how this interacts with locks in the NULL case. Does this function take the lock?
 static CCapU128 *iocap_keymngr_get_and_lock_key(device_t, uint8_t key_id);
 
 static void iocap_keymngr_unlock_key(device_t, uint8_t key_id);
@@ -227,7 +228,7 @@ static void iocap_keymngr_unlock_key(device_t, uint8_t key_id);
 static void iocap_keymngr_clear_key(device_t, uint8_t key_id);
 
 // Clear data for all given key IDs and mark them as not-allocated so other tags can reuse them.
-static void iocap_keymngr_free_key_ids(device_t, uint8_t *key_ids,
+static void iocap_keymngr_free_key_ids(device_t, uint8_t const *key_ids,
 		uint8_t n_key_ids);
 
 
@@ -235,31 +236,13 @@ static void iocap_keymngr_free_key_ids(device_t, uint8_t *key_ids,
 // If the refcount increases from zero for that key call iocap_keymngr_init_key.
 static int
 iocap_enabled_tag_inc_refcount(bus_dma_iocap_enabled_tag_t tag,
-		uint8_t nth_key_of_tag)
-{
-	// TODO take a lock on the tag
-	tag->key_refcounts[nth_key_of_tag]++;
-	if (tag->key_refcounts[nth_key_of_tag] == 1) {
-		iocap_keymngr_init_key(tag->iocap_keymngr,
-				tag->allocated_keys[nth_key_of_tag]);
-	}
-	return 0;
-}
+		uint8_t nth_key_of_tag);
 
 // Decremnt the refcount for a key on a given tag.
 // When the refcount hits zero, call iocap_keymngr_clear_key to clear the key data but keep the key index allocated.
 static int
 iocap_enabled_tag_dec_refcount(bus_dma_iocap_enabled_tag_t tag,
-		uint8_t nth_key_of_tag)
-{
-	// TODO take a lock on the tag
-	tag->key_refcounts[nth_key_of_tag]--;
-	if (tag->key_refcounts[nth_key_of_tag] == 0) {
-		iocap_keymngr_clear_key(tag->iocap_keymngr,
-				tag->allocated_keys[nth_key_of_tag]);
-	}
-	return 0;
-}
+		uint8_t nth_key_of_tag);
 
 
 static int
@@ -320,6 +303,11 @@ iocap_keymngr_attach(device_t dev)
 	sc->base_refinable_tag.iocap_keymngr = dev;
 	sc->base_refinable_tag.base_tag = bus_get_dma_tag(dev);
 
+	sc->available_keys = 256;
+	// The key allocator is very simple: if available_keys >= 1, increment
+	// last_allocated_key until !sc->keys[last_allocated_key].allocated.
+	sc->last_allocated_key = 0xFF;
+
 	iocap_keymngr_dbg_perfcounters(dev);
 
 	// TODO setup lock
@@ -375,6 +363,198 @@ iocap_keymngr_dbg_perfcounters(device_t dev)
 	uint64_t bad_write = bus_space_read_8(sc->bst, sc->bsh, 0x1018);
 	device_printf(dev, "perf counters: %ld %ld %ld %ld\n", good_read,
 			bad_read, good_write, bad_write);
+}
+
+// Assign n_key_ids key IDs to a tag, without reusing key IDs already assigned to other tags
+static int iocap_keymngr_alloc_key_ids(device_t dev, uint8_t *key_ids,
+		uint8_t n_key_ids)
+{
+	struct iocap_keymngr_softc *sc;
+
+	sc = device_get_softc(dev);
+
+	// TODO take lock on key manager
+
+	if (sc->available_keys < n_key_ids) {
+		return ENOSPC;
+	}
+
+	for (int i = 0; i < n_key_ids; i++) {
+		// Search through keys until we find one that isn't allocated
+		do {
+			// will wrap around at 256
+			sc->last_allocated_key++;
+		}
+		while (sc->keys[sc->last_allocated_key].allocated); // TODO lock key?
+		// Allocate the key
+
+		// TODO take lock on key
+
+		sc->keys[sc->last_allocated_key].allocated = true;
+		KASSERT(!sc->keys[sc->last_allocated_key].active,
+			("Key #%d is freshly allocated but already active.\n",
+				sc->last_allocated_key));
+
+		// TODO release lock on key
+
+		key_ids[i] = sc->last_allocated_key;
+	}
+
+	// TODO unlock key manager
+
+	return 0;
+}
+
+// Fill the key data for this id with random data so it can be used to mint iocaps.
+// Takes the lock for the key.
+static void iocap_keymngr_init_key(device_t dev, uint8_t key_id)
+{
+	struct iocap_keymngr_softc *sc;
+
+	sc = device_get_softc(dev);
+
+	// TODO take lock on key
+
+	KASSERT(sc->keys[key_id].allocated,
+		("Key %d must be allocated in order to become active", key_id));
+	KASSERT(!sc->keys[key_id].active,
+		("Key %d must not already be active", key_id));
+
+	// Take random data
+	arc4random_buf(sc->keys[key_id].key_data, 16);
+	sc->keys[key_id].active = true;
+	// Write the key data into the MMIO device
+	bus_space_write_multi_4(sc->bst, sc->bsh, 0x1000 + (key_id << 4),
+		sc->keys[key_id].key_data, 4);
+	// TODO memory barrier?
+	// Set the key status in the MMIO device as 1
+	bus_space_write_4(sc->bst, sc->bsh, 0x0 + (key_id << 4), 1);
+
+	// TODO release lock on key
+}
+
+// Retrieve the key data for this id so we can use it to mint an IOCap,
+// and takes the lock on the key so it doesn't change while minting.
+// Return NULL if not inited, and still takes the lock in this case.
+// Must call iocap_keymngr_unlock_key() after using the key to release it to others.
+static CCapU128 *iocap_keymngr_get_and_lock_key(device_t dev, uint8_t key_id)
+{
+	struct iocap_keymngr_softc *sc;
+
+	sc = device_get_softc(dev);
+
+	// TODO take lock on key
+
+	if (!sc->keys[key_id].active) {
+		return NULL;
+	}
+
+	return &sc->keys[key_id].key_data;
+}
+
+static void iocap_keymngr_unlock_key(device_t dev, uint8_t key_id)
+{
+	struct iocap_keymngr_softc *sc;
+
+	sc = device_get_softc(dev);
+
+	// TODO release lock on key
+}
+
+// Clear out the key data for this ID.
+// Takes the lock for the key while clearing.
+static void iocap_keymngr_clear_key(device_t dev, uint8_t key_id)
+{
+	struct iocap_keymngr_softc *sc;
+
+	sc = device_get_softc(dev);
+
+	// TODO take lock on key
+
+	KASSERT(sc->keys[key_id].allocated,
+		("Key %d must be allocated in order to clear", key_id));
+	KASSERT(sc->keys[key_id].active,
+		("Key %d must be active to clear it", key_id));
+
+	// Tell device to start revoking as early as possible
+	bus_space_write_4(sc->bst, sc->bsh, 0x0 + (key_id << 4), 0);
+	// Clear data out
+	memset(sc->keys[key_id].key_data, 0, 16);
+	sc->keys[key_id].active = false;
+	// Check the MMIO device has actually revoked
+	while (bus_space_read_4(sc->bst, sc->bsh, 0x0 + (key_id << 4)) != 0) {
+		// wait until the MMIO device confirms revocation with
+		// key status == 0
+	}
+
+	// TODO release lock on key
+}
+
+// Clear data for all given key IDs and mark them as not-allocated so other tags can reuse them.
+static void iocap_keymngr_free_key_ids(device_t dev, uint8_t const *key_ids,
+		uint8_t n_key_ids)
+{
+	struct iocap_keymngr_softc *sc;
+
+	sc = device_get_softc(dev);
+
+	// TODO take lock on key manager
+
+	KASSERT(n_key_ids + sc->available_keys <= 256,
+		("Inconsistency: somehow we are freeing %d key IDs but already have %d available.",
+			n_key_ids, sc->available_keys));
+
+	for (int i = 0; i < n_key_ids; i++) {
+		uint8_t key_id;
+
+		key_id = key_ids[i];
+
+		// TODO take lock on key
+
+		KASSERT(!sc->keys[key_id].active,
+			("Trying to free key ID #%d when it's still active\n",
+				key_id));
+		sc->keys[key_id].allocated = false;
+
+		// TODO release lock on key
+
+		sc->available_keys++;
+	}
+
+	// TODO unlock key manager
+}
+
+
+// Increment the refcount for a key on a given tag.
+// If the refcount increases from zero for that key call iocap_keymngr_init_key.
+static int
+iocap_enabled_tag_inc_refcount(bus_dma_iocap_enabled_tag_t tag,
+		uint8_t nth_key_of_tag)
+{
+	// TODO take a lock on the tag
+	tag->key_refcounts[nth_key_of_tag]++;
+	if (tag->key_refcounts[nth_key_of_tag] == 1) {
+		iocap_keymngr_init_key(tag->iocap_keymngr,
+				tag->allocated_keys[nth_key_of_tag]);
+	}
+	// TODO release lock on tag
+	return 0;
+}
+
+// Decremnt the refcount for a key on a given tag.
+// When the refcount hits zero, call iocap_keymngr_clear_key to clear the key data but keep the key index allocated.
+static int
+iocap_enabled_tag_dec_refcount(bus_dma_iocap_enabled_tag_t tag,
+		uint8_t nth_key_of_tag)
+{
+	// TODO take a lock on the tag
+	tag->key_refcounts[nth_key_of_tag]--;
+	if (tag->key_refcounts[nth_key_of_tag] == 0) {
+		iocap_keymngr_clear_key(tag->iocap_keymngr,
+				tag->allocated_keys[nth_key_of_tag]);
+	}
+	// TODO release lock on tag
+	return 0;
 }
 
 static int
@@ -949,6 +1129,8 @@ bus_dma_tag_refine_to_iocap_group(bus_dma_iocap_refinable_tag_t tag,
 	int error = iocap_keymngr_alloc_key_ids(tag->iocap_keymngr,
 			new_tag->allocated_keys, params.n_keys);
 	if (error) {
+		free(new_tag, M_IOCAP_DMAMAP);
+		*out = NULL;
 		return error;
 	}
 
@@ -986,26 +1168,30 @@ bus_dmamap_mint_iocap(bus_iocap_dmamap_t map, bus_dma_segment_t *segment,
 
 	uint8_t key_id;
 	CCapU128 *key;
+	CCapResult res;
 
 	key_id = map->tag->allocated_keys[map->nth_key_of_tag];
 	key = iocap_keymngr_get_and_lock_key(map->tag->iocap_keymngr, key_id);
+	res = CCapResult_CatastrophicFailure;
 
-	CCapResult res = ccap2024_11_init_cavs_exact(
+	if (key != NULL) {
+		res = ccap2024_11_init_cavs_exact(
 			&out->cap,
 			key,
 			segment->ds_addr,
 			segment->ds_len,
 			key_id,
 			perms);
+	}
 
 	iocap_keymngr_unlock_key(map->tag->iocap_keymngr, key_id);
 
 	if (res != CCapResult_Success) {
 		device_printf(map->tag->iocap_keymngr,
-				"failed to mint iocap for %lx..%lx with key #%d perms %s: %s\n",
-				segment->ds_addr, segment->ds_len, key_id,
+				"failed to mint iocap for %lx..%lx with key #%d (%p) perms %s: %s\n",
+				segment->ds_addr, segment->ds_len, key_id, key,
 				ccap_perms_str(perms), ccap_result_str(res));
-		return EDOM;
+		return (key == NULL) ? EPERM : EDOM;
 	}
 
 	return 0;
@@ -1034,31 +1220,35 @@ bus_dmamap_mint_virtio_iocap(bus_iocap_dmamap_t map, bus_dma_segment_t *segment,
 
 	uint8_t key_id;
 	CCapU128 *key;
+	CCapResult res = CCapResult_CatastrophicFailure;
+	CCapNativeVirtqDesc desc;
 
 	key_id = map->tag->allocated_keys[map->nth_key_of_tag];
 	key = iocap_keymngr_get_and_lock_key(map->tag->iocap_keymngr, key_id);
 
-	CCapNativeVirtqDesc desc = {
-		.addr = segment->ds_addr,
-		.len = segment->ds_len,
-		.flags = flags,
-		.next = next
-	};
+	if (key != NULL) {
+		desc = CCapNativeVirtqDesc {
+			.addr = segment->ds_addr,
+			.len = segment->ds_len,
+			.flags = flags,
+			.next = next
+		};
 
-	CCapResult res = ccap2024_11_init_virtio_cavs_exact(
-			&out->cap,
-			key,
-			&desc,
-			key_id);
+		res = ccap2024_11_init_virtio_cavs_exact(
+				&out->cap,
+				key,
+				&desc,
+				key_id);
+	}
 
 	iocap_keymngr_unlock_key(map->tag->iocap_keymngr, key_id);
 
 	if (res != CCapResult_Success) {
 		device_printf(map->tag->iocap_keymngr,
-				"failed to mint virtio iocap for %lx..%lx with key #%d flags %x next %d: %s\n",
-				segment->ds_addr, segment->ds_len, key_id,
+				"failed to mint virtio iocap for %lx..%lx with key #%d (%p) flags %x next %d: %s\n",
+				segment->ds_addr, segment->ds_len, key_id, key,
 				flags, next, ccap_result_str(res));
-		return EDOM;
+		return (key == NULL) ? EPERM : EDOM;
 	}
 
 	return 0;
