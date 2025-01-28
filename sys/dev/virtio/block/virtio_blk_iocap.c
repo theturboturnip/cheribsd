@@ -28,6 +28,8 @@
 
 /* Driver for VirtIO block devices. */
 
+// ReSharper disable CppDFAUnreachableFunctionCall
+// ReSharper disable CppParameterMayBeConstPtrOrRef
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/kernel.h>
@@ -51,14 +53,17 @@
 
 #include <dev/iocap/iocap_keymngr.h>
 #include <dev/virtio/virtio.h>
-#include <dev/virtio/virtqueue.h> // TODO swap out for virtqueue_iocap once we get that working
+#include <dev/virtio/virtqueue_iocap.h>
 #include <dev/virtio/block/virtio_blk.h>
 
 #include "virtio_if.h"
 
 struct vtblk_iocap_request {
 	struct vtblk_iocap_softc		*vbr_sc;
-	bus_dmamap_t			 vbr_mapp;
+	union {
+		bus_dmamap_t				vbr_mapp;
+		bus_iocap_dmamap_t			vbr_iocap_mapp;
+	};
 
 	/* Fields after this point are zeroed for each request. */
 	struct virtio_blk_outhdr	 vbr_hdr;
@@ -89,9 +94,12 @@ struct vtblk_iocap_softc {
 #define VTBLK_FLAG_BUSDMA_WAIT	0x0020
 #define VTBLK_FLAG_BUSDMA_ALIGN	0x0040
 
-	struct virtqueue	*vtblk_iocap_vq;
+	struct virtq_iocap	*vtblk_iocap_vq;
 	struct sglist		*vtblk_iocap_sglist;
-	bus_dma_tag_t		 vtblk_iocap_dmat;
+	union {
+		bus_dma_tag_t	vtblk_iocap_dmat;
+		bus_dma_iocap_refinable_tag_t	vtblk_iocap_refinable_dmat;
+	};
 	struct disk		*vtblk_iocap_disk;
 
 	struct bio_queue_head	 vtblk_iocap_bioq;
@@ -231,7 +239,8 @@ TUNABLE_INT("hw.vtblk_iocap.writecache_mode", &vtblk_iocap_writecache_mode);
      VIRTIO_BLK_F_TOPOLOGY		| \
      VIRTIO_BLK_F_CONFIG_WCE		| \
      VIRTIO_BLK_F_DISCARD		| \
-     VIRTIO_RING_F_INDIRECT_DESC)
+     VIRTIO_RING_F_INDIRECT_DESC | \
+     VIRTIO_F_IOCAP_QUEUE)
 
 #define VTBLK_MODERN_FEATURES	(VTBLK_COMMON_FEATURES)
 #define VTBLK_LEGACY_FEATURES	(VIRTIO_BLK_F_BARRIER | VTBLK_COMMON_FEATURES)
@@ -318,6 +327,7 @@ vtblk_iocap_probe(device_t dev)
 	if (bus_dma_tag_iocap_refinable(bus_get_dma_tag(dev)) == 0)
 		return (ENXIO);
 	device_set_desc(dev, virtio_blk_iocap_match.description);
+	// TODO switch to BUS_PROBE_VENDOR or BUS_PROBE_SPECIFIC and remove the not-iocap logic from the virtio_blk driver
 	return (BUS_PROBE_DEFAULT);
 }
 
@@ -327,6 +337,7 @@ vtblk_iocap_attach(device_t dev)
 	struct vtblk_iocap_softc *sc;
 	struct virtio_blk_config blkcfg;
 	int error;
+	bus_dma_tag_t intermediate_tag;
 
 	sc = device_get_softc(dev);
 	sc->vtblk_iocap_dev = dev;
@@ -399,10 +410,18 @@ vtblk_iocap_attach(device_t dev)
 	    0,						/* flags */
 	    busdma_lock_mutex,				/* lockfunc */
 	    &sc->vtblk_iocap_mtx,				/* lockarg */
-	    &sc->vtblk_iocap_dmat);
-	// TODO try to refine the dmatag with a iocap-bus specific function
+	    &intermediate_tag);
 	if (error) {
 		device_printf(dev, "cannot create bus dma tag\n");
+		goto fail;
+	}
+	// Initialize vtblk_iocap_refinable_dmat and vtblk_dmat at the same time.
+	// They're in a union so that we can reference as generic bus_dma_tag_t
+	// when convenient
+	sc->vtblk_iocap_refinable_dmat = bus_dma_tag_iocap_refinable(intermediate_tag);
+	if (sc->vtblk_iocap_refinable_dmat == NULL) {
+		error = ENOTSUP;
+		device_printf(dev, "bus dma tag was not iocap-refinable\n");
 		goto fail;
 	}
 
@@ -435,7 +454,7 @@ vtblk_iocap_attach(device_t dev)
 		goto fail;
 	}
 
-	virtqueue_enable_intr(sc->vtblk_iocap_vq);
+	virtq_iocap_enable_intr(sc->vtblk_iocap_vq);
 
 fail:
 	if (error)
@@ -718,6 +737,7 @@ vtblk_iocap_alloc_virtqueue(struct vtblk_iocap_softc *sc)
 	    vtblk_iocap_vq_intr, sc, &sc->vtblk_iocap_vq,
 	    "%s request", device_get_nameunit(dev));
 
+	// TODO this needs to be able to alloc virtq_iocap
 	return (virtio_alloc_virtqueues(dev, 1, &vq_info));
 }
 
@@ -851,7 +871,7 @@ vtblk_iocap_request_prealloc(struct vtblk_iocap_softc *sc)
 	struct vtblk_iocap_request *req;
 	int i, nreqs;
 
-	nreqs = virtqueue_size(sc->vtblk_iocap_vq);
+	nreqs = virtq_iocap_size(sc->vtblk_iocap_vq);
 
 	/*
 	 * Preallocate sufficient requests to keep the virtqueue full. Each
@@ -870,6 +890,10 @@ vtblk_iocap_request_prealloc(struct vtblk_iocap_softc *sc)
 		if (bus_dmamap_create(sc->vtblk_iocap_dmat, 0, &req->vbr_mapp)) {
 			free(req, M_DEVBUF);
 			return (ENOMEM);
+		}
+		if (!bus_dmamap_can_mint_iocap(req->vbr_mapp)) {
+			device_printf(sc->vtblk_iocap_dev, "tried to prealloc a dmamap that can't mint IOCaps\n");
+			return (EINVAL);
 		}
 
 		MPASS(sglist_count(&req->vbr_hdr, sizeof(req->vbr_hdr)) == 1);
@@ -1035,7 +1059,7 @@ vtblk_iocap_request_execute_cb(void * callback_arg, bus_dma_segment_t * segs,
 {
 	struct vtblk_iocap_request *req;
 	struct vtblk_iocap_softc *sc;
-	struct virtqueue *vq;
+	struct virtq_iocap *vq;
 	struct sglist *sg;
 	struct bio *bp;
 	int ordered, readable, writable, i;
@@ -1073,7 +1097,7 @@ vtblk_iocap_request_execute_cb(void * callback_arg, bus_dma_segment_t * segs,
 			goto out;
 		}
 		if (bp->bio_flags & BIO_ORDERED) {
-			if (!virtqueue_empty(vq)) {
+			if (!virtq_iocap_empty(vq)) {
 				error = EBUSY;
 				goto out;
 			}
@@ -1148,7 +1172,7 @@ vtblk_iocap_request_execute_cb(void * callback_arg, bus_dma_segment_t * segs,
 		}
 	}
 
-	error = virtqueue_enqueue(vq, req, sg, readable, writable);
+	error = virtq_iocap_enqueue(vq, req->vbr_iocap_mapp, req, sg, readable, writable);
 	if (error == 0 && ordered)
 		sc->vtblk_iocap_req_ordered = req;
 
@@ -1158,7 +1182,7 @@ vtblk_iocap_request_execute_cb(void * callback_arg, bus_dma_segment_t * segs,
 	 * performed already.
 	 */
 	if (error == 0 && req->vbr_busdma_wait)
-		virtqueue_notify(vq);
+		virtq_iocap_notify(vq);
 
 out:
 	if (error && (req->vbr_mapp != NULL))
@@ -1224,7 +1248,7 @@ vtblk_iocap_queue_completed(struct vtblk_iocap_softc *sc, struct bio_queue *queu
 	struct vtblk_iocap_request *req;
 	struct bio *bp;
 
-	while ((req = virtqueue_dequeue(sc->vtblk_iocap_vq, NULL)) != NULL) {
+	while ((req = virtq_iocap_dequeue(sc->vtblk_iocap_vq, NULL)) != NULL) {
 		bp = vtblk_iocap_queue_complete_one(sc, req);
 
 		TAILQ_INSERT_TAIL(queue, bp, bio_queue);
@@ -1247,20 +1271,20 @@ vtblk_iocap_done_completed(struct vtblk_iocap_softc *sc, struct bio_queue *queue
 static void
 vtblk_iocap_drain_vq(struct vtblk_iocap_softc *sc)
 {
-	struct virtqueue *vq;
+	struct virtq_iocap *vq;
 	struct vtblk_iocap_request *req;
 	int last;
 
 	vq = sc->vtblk_iocap_vq;
 	last = 0;
 
-	while ((req = virtqueue_drain(vq, &last)) != NULL) {
+	while ((req = virtq_iocap_drain(vq, &last)) != NULL) {
 		vtblk_iocap_bio_done(sc, req->vbr_bp, ENXIO);
 		vtblk_iocap_request_enqueue(sc, req);
 	}
 
 	sc->vtblk_iocap_req_ordered = NULL;
-	KASSERT(virtqueue_empty(vq), ("virtqueue not empty"));
+	KASSERT(virtq_iocap_empty(vq), ("virtq_iocap not empty"));
 }
 
 static void
@@ -1298,7 +1322,7 @@ vtblk_iocap_drain(struct vtblk_iocap_softc *sc)
 static void
 vtblk_iocap_startio(struct vtblk_iocap_softc *sc)
 {
-	struct virtqueue *vq;
+	struct virtq_iocap *vq;
 	struct vtblk_iocap_request *req;
 	int enq;
 
@@ -1309,7 +1333,7 @@ vtblk_iocap_startio(struct vtblk_iocap_softc *sc)
 	if (sc->vtblk_iocap_flags & (VTBLK_FLAG_SUSPEND | VTBLK_FLAG_BUSDMA_WAIT))
 		return;
 
-	while (!virtqueue_full(vq)) {
+	while (!virtq_iocap_full(vq)) {
 		req = vtblk_iocap_request_next(sc);
 		if (req == NULL)
 			break;
@@ -1322,7 +1346,7 @@ vtblk_iocap_startio(struct vtblk_iocap_softc *sc)
 	}
 
 	if (enq > 0)
-		virtqueue_notify(vq);
+		virtq_iocap_notify(vq);
 }
 
 static void
@@ -1441,21 +1465,21 @@ static int
 vtblk_iocap_poll_request(struct vtblk_iocap_softc *sc, struct vtblk_iocap_request *req)
 {
 	struct vtblk_iocap_request *req1 __diagused;
-	struct virtqueue *vq;
+	struct virtq_iocap *vq;
 	struct bio *bp;
 	int error;
 
 	vq = sc->vtblk_iocap_vq;
 
-	if (!virtqueue_empty(vq))
+	if (!virtq_iocap_empty(vq))
 		return (EBUSY);
 
 	error = vtblk_iocap_request_execute(req, BUS_DMA_NOWAIT);
 	if (error)
 		return (error);
 
-	virtqueue_notify(vq);
-	req1 = virtqueue_poll(vq, NULL);
+	virtq_iocap_notify(vq);
+	req1 = virtq_iocap_poll(vq, NULL);
 	KASSERT(req == req1,
 	    ("%s: polling completed %p not %p", __func__, req1, req));
 
@@ -1479,7 +1503,7 @@ vtblk_iocap_quiesce(struct vtblk_iocap_softc *sc)
 	VTBLK_LOCK_ASSERT(sc);
 	error = 0;
 
-	while (!virtqueue_empty(sc->vtblk_iocap_vq)) {
+	while (!virtq_iocap_empty(sc->vtblk_iocap_vq)) {
 		if (mtx_sleep(&sc->vtblk_iocap_vq, VTBLK_MTX(sc), PRIBIO, "vtblk_iocapq",
 		    VTBLK_QUIESCE_TIMEOUT) == EWOULDBLOCK) {
 			error = EBUSY;
@@ -1494,7 +1518,7 @@ static void
 vtblk_iocap_vq_intr(void *xsc)
 {
 	struct vtblk_iocap_softc *sc;
-	struct virtqueue *vq;
+	struct virtq_iocap *vq;
 	struct bio_queue queue;
 
 	sc = xsc;
@@ -1510,8 +1534,8 @@ again:
 	vtblk_iocap_queue_completed(sc, &queue);
 	vtblk_iocap_startio(sc);
 
-	if (virtqueue_enable_intr(vq) != 0) {
-		virtqueue_disable_intr(vq);
+	if (virtq_iocap_enable_intr(vq) != 0) {
+		virtq_iocap_disable_intr(vq);
 		goto again;
 	}
 
@@ -1527,7 +1551,7 @@ static void
 vtblk_iocap_stop(struct vtblk_iocap_softc *sc)
 {
 
-	virtqueue_disable_intr(sc->vtblk_iocap_vq);
+	virtq_iocap_disable_intr(sc->vtblk_iocap_vq);
 	virtio_stop(sc->vtblk_iocap_dev);
 }
 
@@ -1540,7 +1564,7 @@ vtblk_iocap_dump_quiesce(struct vtblk_iocap_softc *sc)
 	 * dump are completed and queued. The queued requests will be
 	 * biodone'd once the dump is finished.
 	 */
-	while (!virtqueue_empty(sc->vtblk_iocap_vq))
+	while (!virtq_iocap_empty(sc->vtblk_iocap_vq))
 		vtblk_iocap_queue_completed(sc, &sc->vtblk_iocap_dump_queue);
 }
 

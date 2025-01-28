@@ -3552,6 +3552,7 @@ dev/vge/if_vge.c		optional vge
 dev/viapm/viapm.c		optional viapm pci
 dev/virtio/virtio.c			optional	virtio
 dev/virtio/virtqueue.c			optional	virtio
+dev/virtio/virtqueue_iocap.c			optional	virtio_iocap iocap
 dev/virtio/virtio_bus_if.m		optional	virtio
 dev/virtio/virtio_if.m			optional	virtio
 dev/virtio/pci/virtio_pci.c		optional	virtio_pci
