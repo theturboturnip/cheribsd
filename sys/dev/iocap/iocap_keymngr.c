@@ -31,6 +31,7 @@
 static_assert(offsetof(struct bus_dma_tag_common, impl) == 0,
 		"struct bus_dma_tag_common must start with an impl vtable");
 
+static MALLOC_DEFINE(M_IOCAP_DMATAG, "iocap_dmatag", "IOCAP DMA Tag");
 static MALLOC_DEFINE(M_IOCAP_DMAMAP, "iocap_dmamap", "IOCAP DMA Map");
 
 #define MAX_NUM_KEYS_PER_TAG 4
@@ -143,7 +144,7 @@ struct bus_iocap_dmamap {
 };
 
 
-struct bus_dma_impl bus_dma_iocap_refinable_tag_impl;
+extern struct bus_dma_impl bus_dma_iocap_refinable_tag_impl;
 
 static int iocap_keymngr_probe(device_t);
 
@@ -301,7 +302,24 @@ iocap_keymngr_attach(device_t dev)
 
 	sc->base_refinable_tag.common.impl = &bus_dma_iocap_refinable_tag_impl;
 	sc->base_refinable_tag.iocap_keymngr = dev;
-	sc->base_refinable_tag.base_tag = bus_get_dma_tag(dev);
+	error = bus_dma_tag_create(
+		bus_get_dma_tag(dev),
+		1, // any alignment
+		0, // no boundary restrictions
+		BUS_SPACE_MAXADDR, // excluded zone = 0 (BUS_SPACE_MAXADDR..BUS_SPACE_MAXADDR)
+		BUS_SPACE_MAXADDR,
+		NULL, NULL, // filtfunc and filtfunc arg are deprecated
+		maxphys,					/* max request size */
+		16,	/* TODO max # segments is this enough */
+		maxphys,					/* max segment size */
+		0, // no flags
+		NULL, NULL, // lockfunc, lockfuncarg not used
+		&sc->base_refinable_tag.base_tag
+	);
+	if (error != 0) {
+		device_printf(dev, "could not allocate dma tag from parent %s\n", device_get_name(device_get_parent(dev)));
+		goto fail;
+	}
 
 	sc->available_keys = 256;
 	// The key allocator is very simple: if available_keys >= 1, increment
@@ -335,8 +353,15 @@ iocap_keymngr_detach(device_t dev)
 	// TODO
 	// 	VTBLK_LOCK(sc);
 
-	if (sc->sc_rres != NULL)
+	if (sc->base_refinable_tag.base_tag != NULL) {
+		bus_dma_tag_destroy(sc->base_refinable_tag.base_tag);
+		sc->base_refinable_tag.base_tag = NULL;
+	}
+
+	if (sc->sc_rres != NULL) {
 		bus_release_resource(dev, sc->sc_rtype, sc->sc_rrid, sc->sc_rres);
+		sc->sc_rres = NULL;
+	}
 
 	// TODO
 	//	VTBLK_UNLOCK(sc);
@@ -565,19 +590,36 @@ refinable_tag_create(bus_dma_tag_t parent,
 		bus_size_t maxsegsz, int flags, bus_dma_lock_t *lockfunc,
 		void *lockfuncarg, bus_dma_tag_t *dmat)
 {
-	// TODO return a refinable tag not the default one?
 	struct bus_dma_iocap_refinable_tag *refine_parent;
 	struct bus_dma_impl *parent_base_impl;
+	int error;
 
 	refine_parent = (struct bus_dma_iocap_refinable_tag *)parent;
 	parent_base_impl = ((struct bus_dma_tag_common *)refine_parent->
 		base_tag)->impl;
 
-	return parent_base_impl->tag_create(
-			refine_parent->base_tag, alignment, boundary, lowaddr,
-			highaddr, maxsize, nsegments, maxsegsz, flags, lockfunc,
-			lockfuncarg, dmat
-			);
+	// Create a new refinable tag with a (base = refined(parent.base))
+	struct bus_dma_iocap_refinable_tag *new_tag = malloc(
+			sizeof(struct bus_dma_iocap_refinable_tag),
+			M_IOCAP_DMATAG, M_ZERO | M_NOWAIT);
+	new_tag->iocap_keymngr = refine_parent->iocap_keymngr;
+	new_tag->common.impl = &bus_dma_iocap_refinable_tag_impl;
+
+	error = parent_base_impl->tag_create(
+		refine_parent->base_tag, alignment, boundary, lowaddr,
+		highaddr, maxsize, nsegments, maxsegsz, flags, lockfunc,
+		lockfuncarg, &new_tag->base_tag
+	);
+
+	if (error != 0) {
+		free(new_tag, M_IOCAP_DMATAG);
+		device_printf(refine_parent->iocap_keymngr, "failed to tag_create from base to make new refinable tag\n");
+		return error;
+	}
+
+	*dmat = (bus_dma_tag_t)new_tag;
+
+	return 0;
 }
 
 static int
@@ -585,11 +627,16 @@ refinable_tag_destroy(bus_dma_tag_t dmat)
 {
 	struct bus_dma_iocap_refinable_tag *refine_dmat;
 	struct bus_dma_impl *base_impl;
+	int error;
 
 	refine_dmat = (struct bus_dma_iocap_refinable_tag *)dmat;
 	base_impl = ((struct bus_dma_tag_common *)refine_dmat->base_tag)->impl;
 
-	return base_impl->tag_destroy(refine_dmat->base_tag);
+	error = base_impl->tag_destroy(refine_dmat->base_tag);
+
+	free(refine_dmat, M_IOCAP_DMATAG);
+
+	return error;
 }
 
 static int
@@ -755,6 +802,9 @@ struct bus_dma_impl bus_dma_iocap_refinable_tag_impl = {
 	.map_unload = refinable_map_unload,
 	.map_sync = refinable_map_sync
 };
+
+// TODO don't increment the refcount on create/destroy!
+// TODO increment the refcount on load/unload!
 
 // malloc-s a struct bus_iocap_dmamap, populating all fields except the base_map
 // and incrementing the refcount for the relevent key.
