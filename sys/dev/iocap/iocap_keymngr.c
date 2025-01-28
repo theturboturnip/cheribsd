@@ -424,8 +424,9 @@ static void iocap_keymngr_init_key(device_t dev, uint8_t key_id)
 	arc4random_buf(sc->keys[key_id].key_data, 16);
 	sc->keys[key_id].active = true;
 	// Write the key data into the MMIO device
+	// TODO assuming it's safe to cast the data to uint32_t. Need to ensure alignment
 	bus_space_write_multi_4(sc->bst, sc->bsh, 0x1000 + (key_id << 4),
-		sc->keys[key_id].key_data, 4);
+		(uint32_t*)sc->keys[key_id].key_data, 4);
 	// TODO memory barrier?
 	// Set the key status in the MMIO device as 1
 	bus_space_write_4(sc->bst, sc->bsh, 0x0 + (key_id << 4), 1);

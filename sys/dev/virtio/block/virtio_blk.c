@@ -314,7 +314,7 @@ vtblk_probe(device_t dev)
 	// If IOCaps are supported by the device, and our bus returns tags which we can refine with IOCap support,
 	// reject the device. The IOCap-specific driver will pick it up.
 	if (virtio_get_iocap_support(dev) != 0) {
-		if (bus_dma_tag_iocap_refinable(bus_get_dma_tag(dev)) == 1) {
+		if (bus_dma_tag_iocap_refinable(bus_get_dma_tag(dev)) != NULL) {
 			return (ENXIO);
 		}
 	}
