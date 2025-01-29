@@ -45,12 +45,15 @@
 #include <sys/malloc.h>
 #include <sys/rman.h>
 #include <sys/endian.h>
+#include <sys/memdesc.h>
 
 #include <machine/bus.h>
 #include <machine/resource.h>
 
+#include <dev/iocap/iocap_keymngr.h>
 #include <dev/virtio/virtio.h>
 #include <dev/virtio/virtqueue.h>
+#include <dev/virtio/virtqueue_iocap.h>
 #include <dev/virtio/mmio/virtio_mmio.h>
 
 #include "virtio_mmio_if.h"
@@ -59,6 +62,17 @@
 
 struct vtmmio_virtqueue {
 	struct virtqueue	*vtv_vq;
+	int			 vtv_no_intr;
+};
+
+struct vtmmio_iocap_virtqueue {
+	device_t		vtmmio;
+	struct virtq_iocap	*vtv_vq_iocap;
+	// TODO make sure to destroy this at the appropriate time
+	bus_iocap_dmamap_t	 mapping;
+	// An errno signalled by the callback that loaded data into the `mapping`.
+	int			 mapping_err;
+	struct iocap		 iocap;
 	int			 vtv_no_intr;
 };
 
@@ -77,6 +91,9 @@ static void	vtmmio_set_virtqueue(struct vtmmio_softc *sc,
 		    struct virtqueue *vq, uint32_t size);
 static int	vtmmio_alloc_virtqueues(device_t, int,
 		    struct vq_alloc_info *);
+static int	vtmmio_alloc_iocap_virtqueues(device_t,
+		    bus_dma_iocap_enabled_tag_t, int,
+		    struct vq_iocap_alloc_info *);
 static int	vtmmio_setup_intr(device_t, enum intr_type);
 static void	vtmmio_stop(device_t);
 static void	vtmmio_poll(device_t);
@@ -155,6 +172,7 @@ static device_method_t vtmmio_methods[] = {
 	DEVMETHOD(virtio_bus_finalize_features,	  vtmmio_finalize_features),
 	DEVMETHOD(virtio_bus_with_feature,	  vtmmio_with_feature),
 	DEVMETHOD(virtio_bus_alloc_virtqueues,	  vtmmio_alloc_virtqueues),
+	DEVMETHOD(virtio_bus_alloc_iocap_virtqueues,	  vtmmio_alloc_iocap_virtqueues),
 	DEVMETHOD(virtio_bus_setup_intr,	  vtmmio_setup_intr),
 	DEVMETHOD(virtio_bus_stop,		  vtmmio_stop),
 	DEVMETHOD(virtio_bus_poll,		  vtmmio_poll),
@@ -550,6 +568,45 @@ vtmmio_set_virtqueue(struct vtmmio_softc *sc, struct virtqueue *vq,
 	}
 }
 
+static void
+vtmmio_set_virtqueue_iocap(struct vtmmio_softc *sc, struct virtq_iocap *vq,
+	uint32_t size)
+{
+	vm_paddr_t paddr;
+
+	vtmmio_write_config_4(sc, VIRTIO_MMIO_QUEUE_NUM, size);
+
+	if (sc->vtmmio_version == 1) {
+		vtmmio_write_config_4(sc, VIRTIO_MMIO_QUEUE_ALIGN,
+		    VIRTIO_MMIO_VRING_ALIGN);
+		paddr = virtq_iocap_paddr(vq);
+		vtmmio_write_config_4(sc, VIRTIO_MMIO_QUEUE_PFN,
+		    paddr >> PAGE_SHIFT);
+	} else {
+		paddr = virtq_iocap_desc_paddr(vq);
+		vtmmio_write_config_4(sc, VIRTIO_MMIO_QUEUE_DESC_LOW,
+		    paddr);
+		vtmmio_write_config_4(sc, VIRTIO_MMIO_QUEUE_DESC_HIGH,
+		    ((uint64_t)paddr) >> 32);
+
+		paddr = virtq_iocap_avail_paddr(vq);
+		vtmmio_write_config_4(sc, VIRTIO_MMIO_QUEUE_AVAIL_LOW,
+		    paddr);
+		vtmmio_write_config_4(sc, VIRTIO_MMIO_QUEUE_AVAIL_HIGH,
+		    ((uint64_t)paddr) >> 32);
+
+		paddr = virtq_iocap_used_paddr(vq);
+		vtmmio_write_config_4(sc, VIRTIO_MMIO_QUEUE_USED_LOW,
+		    paddr);
+		vtmmio_write_config_4(sc, VIRTIO_MMIO_QUEUE_USED_HIGH,
+		    ((uint64_t)paddr) >> 32);
+
+		// TODO write out the actual iocap contents
+
+		vtmmio_write_config_4(sc, VIRTIO_MMIO_QUEUE_READY, 1);
+	}
+}
+
 static int
 vtmmio_alloc_virtqueues(device_t dev, int nvqs,
     struct vq_alloc_info *vq_info)
@@ -563,6 +620,9 @@ vtmmio_alloc_virtqueues(device_t dev, int nvqs,
 
 	sc = device_get_softc(dev);
 
+	// Ensure we don't allocate plain virtqueues if iocap is negotiated
+	if (sc->vtmmio_features & VIRTIO_F_IOCAP_QUEUE)
+		return (EACCES);
 	if (sc->vtmmio_nvqs != 0)
 		return (EALREADY);
 	if (nvqs <= 0)
@@ -599,6 +659,156 @@ vtmmio_alloc_virtqueues(device_t dev, int nvqs,
 
 		vqx->vtv_vq = *info->vqai_vq = vq;
 		vqx->vtv_no_intr = info->vqai_intr == NULL;
+
+		sc->vtmmio_nvqs++;
+	}
+
+	if (error)
+		vtmmio_free_virtqueues(sc);
+
+	return (error);
+}
+
+static void vtmmio_handle_dmamapped_iocap_virtqueue(void* arg, bus_dma_segment_t* segs, int nsegs, int error)
+{
+	struct vtmmio_iocap_virtqueue *vqx = arg;
+
+	if (error) {
+		device_printf(vqx->vtmmio,
+		    "cannot dmamap memory for iocap virtqueue: %d\n",
+		    error);
+		vqx->mapping_err = error;
+		return;
+	}
+
+	if (nsegs == 0) {
+		device_printf(vqx->vtmmio,
+		    "dmamap callback for iocap virtqueue gave 0 segments\n");
+		vqx->mapping_err = EINVAL;
+		return;
+	}
+
+	if (nsegs > 1) {
+		device_printf(vqx->vtmmio,
+			"dmamap callback for iocap virtqueue gave n %d >1 segments\n", nsegs);
+		vqx->mapping_err = EINVAL;
+		return;
+	}
+
+	error = bus_dmamap_mint_virtio_iocap(vqx->mapping, segs, 0, 0, &vqx->iocap);
+	if (error) {
+		device_printf(vqx->vtmmio,
+		    "cannot generate iocap for iocap virtqueue: %d\n",
+		    error);
+		vqx->mapping_err = error;
+		return;
+	}
+
+	vqx->mapping_err = 0;
+}
+
+static int
+vtmmio_alloc_iocap_virtqueues(device_t dev,
+	bus_dma_iocap_enabled_tag_t queue_tag, int nvqs,
+	struct vq_iocap_alloc_info *vq_info)
+{
+	struct vtmmio_iocap_virtqueue *vqx;
+	struct vq_iocap_alloc_info *info;
+	struct vtmmio_softc *sc;
+	struct virtq_iocap *vq;
+	bus_dmamap_t vq_dmamap;
+	vm_paddr_t vq_paddr;
+	size_t vq_size_bytes;
+	struct memdesc iocap_mem;
+	uint32_t size;
+	int idx, error;
+
+	sc = device_get_softc(dev);
+
+	// Ensure we don't allocate iocap virtqueues if iocap is not negotiated
+	if (!(sc->vtmmio_features & VIRTIO_F_IOCAP_QUEUE))
+		return (EACCES);
+	if (sc->iocap_vq_tag != NULL)
+		return (EALREADY);
+	if (sc->vtmmio_nvqs != 0)
+		return (EALREADY);
+	if (nvqs <= 0)
+		return (EINVAL);
+
+	sc->iocap_vq_tag = queue_tag;
+
+	sc->vtmmio_iocap_vqs = malloc(nvqs * sizeof(struct vtmmio_iocap_virtqueue),
+	    M_DEVBUF, M_NOWAIT | M_ZERO);
+	if (sc->vtmmio_iocap_vqs == NULL)
+		return (ENOMEM);
+
+	if (sc->vtmmio_version == 1) {
+		vtmmio_write_config_4(sc, VIRTIO_MMIO_GUEST_PAGE_SIZE,
+		    (1 << PAGE_SHIFT));
+	}
+
+	for (idx = 0; idx < nvqs; idx++) {
+		vqx = &sc->vtmmio_iocap_vqs[idx];
+		info = &vq_info[idx];
+
+		vqx->vtmmio = dev;
+
+		vtmmio_select_virtqueue(sc, idx);
+		size = vtmmio_read_config_4(sc, VIRTIO_MMIO_QUEUE_NUM_MAX);
+
+		error = virtq_iocap_alloc(dev, idx, size,
+		    VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_MMIO_VRING_ALIGN,
+		    ~(vm_paddr_t)0, info, &vq);
+		if (error) {
+			device_printf(dev,
+			    "cannot allocate iocap virtqueue %d: %d\n",
+			    idx, error);
+			break;
+		}
+
+		vq_paddr = virtq_iocap_paddr(vq);
+		vq_size_bytes = virtq_iocap_size_bytes(vq);
+		iocap_mem = memdesc_paddr(vq_paddr, vq_size_bytes);
+
+		vqx->vtv_vq_iocap = *info->vqai_vq = vq;
+		vqx->vtv_no_intr = info->vqai_intr == NULL;
+
+		error = bus_dmamap_create((bus_dma_tag_t)queue_tag, 0, &vq_dmamap);
+		if (error) {
+			device_printf(dev,
+			    "cannot create dmamap for iocap virtqueue %d: %d\n",
+			    idx, error);
+			break;
+		}
+
+		vqx->mapping = bus_dmamap_can_mint_iocap(vq_dmamap);
+		if (vqx->mapping == NULL) {
+			error = ENOMEM; // TODO
+			device_printf(dev,
+			    "dmamap for iocap virtqueue %d cannot mint iocap\n",
+			    idx);
+			break;
+		}
+
+		error = bus_dmamap_load_mem((bus_dma_tag_t)queue_tag, vq_dmamap, &iocap_mem, &vtmmio_handle_dmamapped_iocap_virtqueue, vqx, BUS_DMA_NOWAIT);
+		if (error) {
+			device_printf(dev,
+			    "cannot dmamap memory for iocap virtqueue %d: %d\n",
+			    idx, error);
+			break;
+		}
+
+		// we can assume the callback has completed because we put in BUS_DMA_NOWAIT
+		// check if it gave an error:
+		if (vqx->mapping_err) {
+			device_printf(dev,
+			    "cannot dmamap memory for iocap virtqueue %d: %d\n",
+			    idx, vqx->mapping_err);
+			break;
+		}
+
+		// we can assume the callback successfully completed.
+		vtmmio_set_virtqueue_iocap(sc, vq, size);
 
 		sc->vtmmio_nvqs++;
 	}
@@ -930,6 +1140,9 @@ vtmmio_reinit_virtqueue(struct vtmmio_softc *sc, int idx)
 	int error;
 	uint16_t size;
 
+	// TODO
+	KASSERT(!(sc->vtmmio_features & VIRTIO_F_IOCAP_QUEUE), ("vtmmio_reinit_virtqueue not implemented for IOCap"));
+
 	vqx = &sc->vtmmio_vqs[idx];
 	vq = vqx->vtv_vq;
 
@@ -962,24 +1175,47 @@ static void
 vtmmio_free_virtqueues(struct vtmmio_softc *sc)
 {
 	struct vtmmio_virtqueue *vqx;
+	struct vtmmio_iocap_virtqueue *vqx_iocap;
 	int idx;
 
 	for (idx = 0; idx < sc->vtmmio_nvqs; idx++) {
-		vqx = &sc->vtmmio_vqs[idx];
+		if (sc->vtmmio_features & VIRTIO_F_IOCAP_QUEUE) {
+			vqx_iocap = &sc->vtmmio_iocap_vqs[idx];
 
-		vtmmio_select_virtqueue(sc, idx);
-		if (sc->vtmmio_version > 1) {
-			vtmmio_write_config_4(sc, VIRTIO_MMIO_QUEUE_READY, 0);
-			vtmmio_read_config_4(sc, VIRTIO_MMIO_QUEUE_READY);
-		} else
-			vtmmio_write_config_4(sc, VIRTIO_MMIO_QUEUE_PFN, 0);
+			vtmmio_select_virtqueue(sc, idx);
+			if (sc->vtmmio_version > 1) {
+				vtmmio_write_config_4(sc, VIRTIO_MMIO_QUEUE_READY, 0);
+				vtmmio_read_config_4(sc, VIRTIO_MMIO_QUEUE_READY);
+			} else
+				vtmmio_write_config_4(sc, VIRTIO_MMIO_QUEUE_PFN, 0);
 
-		virtqueue_free(vqx->vtv_vq);
-		vqx->vtv_vq = NULL;
+			if (vqx_iocap->mapping != NULL)
+				bus_dmamap_destroy((bus_dma_tag_t)sc->iocap_vq_tag, (bus_dmamap_t)vqx_iocap->mapping);
+			if (vqx_iocap->vtv_vq_iocap != NULL)
+				virtq_iocap_free(vqx_iocap->vtv_vq_iocap);
+			vqx_iocap->vtv_vq_iocap = NULL;
+		} else {
+			vqx = &sc->vtmmio_vqs[idx];
+
+			vtmmio_select_virtqueue(sc, idx);
+			if (sc->vtmmio_version > 1) {
+				vtmmio_write_config_4(sc, VIRTIO_MMIO_QUEUE_READY, 0);
+				vtmmio_read_config_4(sc, VIRTIO_MMIO_QUEUE_READY);
+			} else
+				vtmmio_write_config_4(sc, VIRTIO_MMIO_QUEUE_PFN, 0);
+
+			virtqueue_free(vqx->vtv_vq);
+			vqx->vtv_vq = NULL;
+		}
 	}
 
-	free(sc->vtmmio_vqs, M_DEVBUF);
+
+	if (sc->vtmmio_vqs != NULL)
+		free(sc->vtmmio_vqs, M_DEVBUF);
 	sc->vtmmio_vqs = NULL;
+	if (sc->vtmmio_iocap_vqs != NULL)
+		free(sc->vtmmio_iocap_vqs, M_DEVBUF);
+	sc->vtmmio_iocap_vqs = NULL;
 	sc->vtmmio_nvqs = 0;
 }
 
@@ -1013,8 +1249,10 @@ static void
 vtmmio_vq_intr(void *arg)
 {
 	struct vtmmio_virtqueue *vqx;
+	struct vtmmio_iocap_virtqueue *vqx_iocap;
 	struct vtmmio_softc *sc;
 	struct virtqueue *vq;
+	struct virtq_iocap *vq_iocap;
 	uint32_t status;
 	int idx;
 
@@ -1030,11 +1268,21 @@ vtmmio_vq_intr(void *arg)
 
 	/* Notify all virtqueues. */
 	if (status & VIRTIO_MMIO_INT_VRING) {
-		for (idx = 0; idx < sc->vtmmio_nvqs; idx++) {
-			vqx = &sc->vtmmio_vqs[idx];
-			if (vqx->vtv_no_intr == 0) {
-				vq = vqx->vtv_vq;
-				virtqueue_intr(vq);
+		if (sc->vtmmio_features & VIRTIO_F_IOCAP_QUEUE) {
+			for (idx = 0; idx < sc->vtmmio_nvqs; idx++) {
+				vqx_iocap = &sc->vtmmio_iocap_vqs[idx];
+				if (vqx_iocap->vtv_no_intr == 0) {
+					vq_iocap = vqx_iocap->vtv_vq_iocap;
+					virtq_iocap_intr(vq_iocap);
+				}
+			}
+		} else {
+			for (idx = 0; idx < sc->vtmmio_nvqs; idx++) {
+				vqx = &sc->vtmmio_vqs[idx];
+				if (vqx->vtv_no_intr == 0) {
+					vq = vqx->vtv_vq;
+					virtqueue_intr(vq);
+				}
 			}
 		}
 	}

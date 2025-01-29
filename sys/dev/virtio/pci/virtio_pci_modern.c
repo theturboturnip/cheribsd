@@ -44,6 +44,7 @@
 #include <dev/pci/pcivar.h>
 #include <dev/pci/pcireg.h>
 
+#include <dev/iocap/iocap_keymngr.h>
 #include <dev/virtio/virtio.h>
 #include <dev/virtio/virtqueue.h>
 #include <dev/virtio/pci/virtio_pci.h>
@@ -113,6 +114,9 @@ static int	vtpci_modern_finalize_features(device_t);
 static bool	vtpci_modern_with_feature(device_t, uint64_t);
 static int	vtpci_modern_alloc_virtqueues(device_t, int,
 		    struct vq_alloc_info *);
+static int	vtpci_modern_alloc_iocap_virtqueues(device_t,
+		    bus_dma_iocap_enabled_tag_t, int,
+		    struct vq_iocap_alloc_info *);
 static int	vtpci_modern_setup_interrupts(device_t, enum intr_type);
 static void	vtpci_modern_stop(device_t);
 static int	vtpci_modern_reinit(device_t, uint64_t);
@@ -221,6 +225,7 @@ static device_method_t vtpci_modern_methods[] = {
 	DEVMETHOD(virtio_bus_finalize_features,	  vtpci_modern_finalize_features),
 	DEVMETHOD(virtio_bus_with_feature,	  vtpci_modern_with_feature),
 	DEVMETHOD(virtio_bus_alloc_virtqueues,	  vtpci_modern_alloc_virtqueues),
+	DEVMETHOD(virtio_bus_alloc_iocap_virtqueues,	  vtpci_modern_alloc_iocap_virtqueues),
 	DEVMETHOD(virtio_bus_setup_intr,	  vtpci_modern_setup_interrupts),
 	DEVMETHOD(virtio_bus_stop,		  vtpci_modern_stop),
 	DEVMETHOD(virtio_bus_reinit,		  vtpci_modern_reinit),
@@ -522,6 +527,14 @@ vtpci_modern_alloc_virtqueues(device_t dev, int nvqs,
 	}
 
 	return (vtpci_alloc_virtqueues(cn, nvqs, vq_info));
+}
+
+static int
+vtpci_modern_alloc_iocap_virtqueues(device_t dev,
+	bus_dma_iocap_enabled_tag_t queue_tag, int nvqs,
+	struct vq_iocap_alloc_info *vq_info)
+{
+	return EPERM;
 }
 
 static int

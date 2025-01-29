@@ -65,7 +65,7 @@ struct virtq_iocap {
 
 	int			 vq_max_indirect_size;
 	bus_size_t		 vq_notify_offset;
-	virtq_iocap_intr_t	*vq_intrhand;
+	virtqueue_intr_t	*vq_intrhand;
 	void			*vq_intrhand_arg;
 
 	struct vring_iocap		 vq_ring;
@@ -164,7 +164,7 @@ SDT_PROBE_DEFINE1(virtqueue, , enqueue_segments, return, "uint16_t");
 int
 virtq_iocap_alloc(device_t dev, uint16_t queue, uint16_t size,
     bus_size_t notify_offset, int align, vm_paddr_t highaddr,
-    struct vq_alloc_info *info, struct virtq_iocap **vqp)
+    struct vq_iocap_alloc_info *info, struct virtq_iocap **vqp)
 {
 	struct virtq_iocap *vq;
 	int error;
@@ -423,6 +423,12 @@ virtq_iocap_used_paddr(struct virtq_iocap *vq)
 {
 
 	return (vtophys(vq->vq_ring.used));
+}
+
+size_t
+virtq_iocap_size_bytes(struct virtq_iocap *vq)
+{
+	return (size_t)vq->vq_iocap_ring_size;
 }
 
 uint16_t

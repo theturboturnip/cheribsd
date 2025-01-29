@@ -31,34 +31,24 @@
 #ifndef _VIRTIO_VIRTQUEUE_IOCAP_H
 #define _VIRTIO_VIRTQUEUE_IOCAP_H
 
+#include <dev/iocap/iocap_keymngr.h>
+#include <dev/virtio/virtqueue.h>
+
 struct virtq_iocap;
 struct sglist;
-
-/* Device callback for a virtqueue interrupt. */
-typedef void virtq_iocap_intr_t(void *);
-
-/*
- * Hint on how long the next interrupt should be postponed. This is
- * only used when the EVENT_IDX feature is negotiated.
- */
-typedef enum {
-	VQ_POSTPONE_SHORT,
-	VQ_POSTPONE_LONG,
-	VQ_POSTPONE_EMPTIED	/* Until all available desc are used. */
-} vq_postpone_t;
 
 #define VIRTQ_IOCAP_MAX_NAME_SZ	32
 
 /* One for each virtqueue the device wishes to allocate. */
-struct vq_alloc_info {
+struct vq_iocap_alloc_info {
 	char		   vqai_name[VIRTQ_IOCAP_MAX_NAME_SZ];
 	int		   vqai_maxindirsz;
-	virtq_iocap_intr_t  *vqai_intr;
+	virtqueue_intr_t  *vqai_intr;
 	void		  *vqai_intr_arg;
 	struct virtq_iocap **vqai_vq;
 };
 
-#define VQ_ALLOC_INFO_INIT(_i,_nsegs,_intr,_arg,_vqp,_str,...) do {	\
+#define VQ_IOCAP_ALLOC_INFO_INIT(_i,_nsegs,_intr,_arg,_vqp,_str,...) do {	\
 	snprintf((_i)->vqai_name, VIRTQ_IOCAP_MAX_NAME_SZ, _str,		\
 	    ##__VA_ARGS__);						\
 	(_i)->vqai_maxindirsz = (_nsegs);				\
@@ -69,7 +59,7 @@ struct vq_alloc_info {
 
 int	 virtq_iocap_alloc(device_t dev, uint16_t queue, uint16_t size,
 	     bus_size_t notify_offset, int align, vm_paddr_t highaddr,
-	     struct vq_alloc_info *info, struct virtq_iocap **vqp);
+	     struct vq_iocap_alloc_info *info, struct virtq_iocap **vqp);
 void	*virtq_iocap_drain(struct virtq_iocap *vq, int *last);
 void	 virtq_iocap_free(struct virtq_iocap *vq);
 int	 virtq_iocap_reinit(struct virtq_iocap *vq, uint16_t size);
@@ -85,6 +75,7 @@ vm_paddr_t virtq_iocap_paddr(struct virtq_iocap *vq);
 vm_paddr_t virtq_iocap_desc_paddr(struct virtq_iocap *vq);
 vm_paddr_t virtq_iocap_avail_paddr(struct virtq_iocap *vq);
 vm_paddr_t virtq_iocap_used_paddr(struct virtq_iocap *vq);
+size_t     virtq_iocap_size_bytes(struct virtq_iocap *vq);
 
 uint16_t virtq_iocap_index(struct virtq_iocap *vq);
 bool	 virtq_iocap_full(struct virtq_iocap *vq);

@@ -38,6 +38,7 @@
 #include <sys/bus.h>
 #include <sys/rman.h>
 
+#include <dev/iocap/iocap_keymngr.h>
 #include <dev/virtio/virtio.h>
 #include <dev/virtio/virtio_config.h>
 #include <dev/virtio/virtqueue.h>
@@ -272,6 +273,15 @@ virtio_alloc_virtqueues(device_t dev, int nvqs,
 
 	return (VIRTIO_BUS_ALLOC_VIRTQUEUES(device_get_parent(dev), nvqs, info));
 }
+
+int
+virtio_alloc_iocap_virtqueues(device_t dev, bus_dma_iocap_enabled_tag_t queue_tag,
+	int nvqs, struct vq_iocap_alloc_info *info)
+{
+
+	return (VIRTIO_BUS_ALLOC_IOCAP_VIRTQUEUES(device_get_parent(dev), queue_tag, nvqs, info));
+}
+
 
 int
 virtio_setup_intr(device_t dev, enum intr_type type)

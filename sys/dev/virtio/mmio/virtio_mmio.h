@@ -31,9 +31,12 @@
 #ifndef	_VIRTIO_MMIO_H
 #define	_VIRTIO_MMIO_H
 
+#include <dev/iocap/iocap_keymngr.h>
+
 DECLARE_CLASS(vtmmio_driver);
 
 struct vtmmio_virtqueue;
+struct vtmmio_iocap_virtqueue;
 
 struct vtmmio_softc {
 	device_t			dev;
@@ -50,6 +53,8 @@ struct vtmmio_softc {
 
 	int				vtmmio_nvqs;
 	struct vtmmio_virtqueue		*vtmmio_vqs;
+	bus_dma_iocap_enabled_tag_t	iocap_vq_tag;
+	struct vtmmio_iocap_virtqueue   *vtmmio_iocap_vqs;
 	void				*ih;
 };
 

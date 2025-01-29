@@ -29,6 +29,7 @@
 #ifndef _VIRTIO_H_
 #define _VIRTIO_H_
 
+#include <dev/iocap/iocap_keymngr.h>
 #include <dev/virtio/virtio_endian.h>
 #include <dev/virtio/virtio_ids.h>
 #include <dev/virtio/virtio_config.h>
@@ -37,6 +38,7 @@
 
 struct sbuf;
 struct vq_alloc_info;
+struct vq_iocap_alloc_info;
 
 /*
  * Each virtqueue indirect descriptor list must be physically contiguous.
@@ -106,6 +108,10 @@ uint64_t virtio_negotiate_features(device_t dev, uint64_t child_features);
 int	 virtio_finalize_features(device_t dev);
 int	 virtio_alloc_virtqueues(device_t dev, int nvqs,
 	     struct vq_alloc_info *info);
+int	 virtio_alloc_iocap_virtqueues(device_t dev,
+		bus_dma_iocap_enabled_tag_t queue_tag,
+		int nvqs,
+		struct vq_iocap_alloc_info *info);
 int	 virtio_setup_intr(device_t dev, enum intr_type type);
 bool	 virtio_with_feature(device_t dev, uint64_t feature);
 void	 virtio_stop(device_t dev);

@@ -30,7 +30,9 @@
 INTERFACE virtio_bus;
 
 HEADER {
+struct bus_dma_iocap_enabled_tag;
 struct vq_alloc_info;
+struct vq_iocap_alloc_info;
 };
 
 CODE {
@@ -65,6 +67,13 @@ METHOD int alloc_virtqueues {
 	device_t	dev;
 	int		nvqs;
 	struct vq_alloc_info *info;
+};
+
+METHOD int alloc_iocap_virtqueues {
+	device_t	dev;
+	struct bus_dma_iocap_enabled_tag* queue_tag;
+	int		nvqs;
+	struct vq_iocap_alloc_info *info;
 };
 
 METHOD int setup_intr {
