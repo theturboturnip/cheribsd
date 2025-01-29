@@ -96,10 +96,8 @@ struct vtblk_iocap_softc {
 
 	struct virtq_iocap	*vtblk_iocap_vq;
 	struct sglist		*vtblk_iocap_sglist;
-	union {
-		bus_dma_tag_t	vtblk_iocap_dmat;
-		bus_dma_iocap_refinable_tag_t	vtblk_iocap_refinable_dmat;
-	};
+	bus_dma_iocap_enabled_tag_t		vtblk_iocap_queues_tag;
+	bus_dma_iocap_enabled_tag_t		vtblk_iocap_request_tag;
 	struct disk		*vtblk_iocap_disk;
 
 	struct bio_queue_head	 vtblk_iocap_bioq;
@@ -338,6 +336,8 @@ vtblk_iocap_attach(device_t dev)
 	struct virtio_blk_config blkcfg;
 	int error;
 	bus_dma_tag_t intermediate_tag;
+	bus_dma_iocap_refinable_tag_t	refinable_tag;
+
 
 	sc = device_get_softc(dev);
 	sc->vtblk_iocap_dev = dev;
@@ -418,10 +418,39 @@ vtblk_iocap_attach(device_t dev)
 	// Initialize vtblk_iocap_refinable_dmat and vtblk_dmat at the same time.
 	// They're in a union so that we can reference as generic bus_dma_tag_t
 	// when convenient
-	sc->vtblk_iocap_refinable_dmat = bus_dma_tag_iocap_refinable(intermediate_tag);
-	if (sc->vtblk_iocap_refinable_dmat == NULL) {
+	refinable_tag = bus_dma_tag_iocap_refinable(intermediate_tag);
+	if (refinable_tag == NULL) {
 		error = ENOTSUP;
 		device_printf(dev, "bus dma tag was not iocap-refinable\n");
+		goto fail;
+	}
+
+	error = bus_dma_tag_refine_to_iocap_group(
+		refinable_tag,
+		(struct iocap_keymngr_revocation_params) {
+			// This is actually fine, because we always unload all mappings together
+			// => lifetime of any given mapping = lifetime of tag
+			.mode = iocap_revoke_when_no_mappings_unsafe,
+			.n_keys = 1
+		},
+		&sc->vtblk_iocap_queues_tag
+	);
+	if (error) {
+		device_printf(dev, "cannot refine bus dma tag to iocap group for holding queues\n");
+		goto fail;
+	}
+
+	error = bus_dma_tag_refine_to_iocap_group(
+		refinable_tag,
+		(struct iocap_keymngr_revocation_params) {
+			// TODO change this!
+			.mode = iocap_revoke_when_no_mappings_unsafe,
+			.n_keys = 1
+		},
+		&sc->vtblk_iocap_request_tag
+	);
+	if (error) {
+		device_printf(dev, "cannot refine bus dma tag to iocap group for holding requests for queue #0\n");
 		goto fail;
 	}
 
@@ -483,9 +512,14 @@ vtblk_iocap_detach(device_t dev)
 		sc->vtblk_iocap_disk = NULL;
 	}
 
-	if (sc->vtblk_iocap_dmat != NULL) {
-		bus_dma_tag_destroy(sc->vtblk_iocap_dmat);
-		sc->vtblk_iocap_dmat = NULL;
+	if (sc->vtblk_iocap_request_tag != NULL) {
+		bus_dma_tag_destroy((bus_dma_tag_t)sc->vtblk_iocap_request_tag);
+		sc->vtblk_iocap_request_tag = NULL;
+	}
+
+	if (sc->vtblk_iocap_queues_tag != NULL) {
+		bus_dma_tag_destroy((bus_dma_tag_t)sc->vtblk_iocap_queues_tag);
+		sc->vtblk_iocap_queues_tag = NULL;
 	}
 
 	if (sc->vtblk_iocap_sglist != NULL) {
@@ -729,16 +763,15 @@ static int
 vtblk_iocap_alloc_virtqueue(struct vtblk_iocap_softc *sc)
 {
 	device_t dev;
-	struct vq_alloc_info vq_info;
+	struct vq_iocap_alloc_info vq_info;
 
 	dev = sc->vtblk_iocap_dev;
 
-	VQ_ALLOC_INFO_INIT(&vq_info, sc->vtblk_iocap_max_nsegs,
+	VQ_IOCAP_ALLOC_INFO_INIT(&vq_info, sc->vtblk_iocap_max_nsegs,
 	    vtblk_iocap_vq_intr, sc, &sc->vtblk_iocap_vq,
 	    "%s request", device_get_nameunit(dev));
 
-	// TODO this needs to be able to alloc virtq_iocap
-	return (virtio_alloc_virtqueues(dev, 1, &vq_info));
+	return (virtio_alloc_iocap_virtqueues(dev, sc->vtblk_iocap_queues_tag, 1, &vq_info));
 }
 
 static void
@@ -887,7 +920,7 @@ vtblk_iocap_request_prealloc(struct vtblk_iocap_softc *sc)
 			return (ENOMEM);
 
 		req->vbr_sc = sc;
-		if (bus_dmamap_create(sc->vtblk_iocap_dmat, 0, &req->vbr_mapp)) {
+		if (bus_dmamap_create((bus_dma_tag_t)sc->vtblk_iocap_request_tag, 0, &req->vbr_mapp)) {
 			free(req, M_DEVBUF);
 			return (ENOMEM);
 		}
@@ -915,7 +948,7 @@ vtblk_iocap_request_free(struct vtblk_iocap_softc *sc)
 
 	while ((req = vtblk_iocap_request_dequeue(sc)) != NULL) {
 		sc->vtblk_iocap_request_count--;
-		bus_dmamap_destroy(sc->vtblk_iocap_dmat, req->vbr_mapp);
+		bus_dmamap_destroy((bus_dma_tag_t)sc->vtblk_iocap_request_tag, req->vbr_mapp);
 		free(req, M_DEVBUF);
 	}
 
@@ -1040,7 +1073,7 @@ vtblk_iocap_request_execute(struct vtblk_iocap_request *req, int flags)
 	 */
 	if ((req->vbr_mapp != NULL) &&
 	    (bp->bio_cmd == BIO_READ || bp->bio_cmd == BIO_WRITE)) {
-		error = bus_dmamap_load_bio(sc->vtblk_iocap_dmat, req->vbr_mapp,
+		error = bus_dmamap_load_bio((bus_dma_tag_t)sc->vtblk_iocap_request_tag, req->vbr_mapp,
 		    req->vbr_bp, vtblk_iocap_request_execute_cb, req, flags);
 		if (error == EINPROGRESS) {
 			req->vbr_busdma_wait = 1;
@@ -1162,11 +1195,11 @@ vtblk_iocap_request_execute_cb(void * callback_arg, bus_dma_segment_t * segs,
 	if (req->vbr_mapp != NULL) {
 		switch (bp->bio_cmd) {
 		case BIO_READ:
-			bus_dmamap_sync(sc->vtblk_iocap_dmat, req->vbr_mapp,
+			bus_dmamap_sync((bus_dma_tag_t)sc->vtblk_iocap_request_tag, req->vbr_mapp,
 			    BUS_DMASYNC_PREREAD);
 			break;
 		case BIO_WRITE:
-			bus_dmamap_sync(sc->vtblk_iocap_dmat, req->vbr_mapp,
+			bus_dmamap_sync((bus_dma_tag_t)sc->vtblk_iocap_request_tag, req->vbr_mapp,
 			    BUS_DMASYNC_PREWRITE);
 			break;
 		}
@@ -1186,7 +1219,7 @@ vtblk_iocap_request_execute_cb(void * callback_arg, bus_dma_segment_t * segs,
 
 out:
 	if (error && (req->vbr_mapp != NULL))
-		bus_dmamap_unload(sc->vtblk_iocap_dmat, req->vbr_mapp);
+		bus_dmamap_unload((bus_dma_tag_t)sc->vtblk_iocap_request_tag, req->vbr_mapp);
 out1:
 	if (error && req->vbr_requeue_on_error)
 		vtblk_iocap_request_requeue_ready(sc, req);
@@ -1227,14 +1260,14 @@ vtblk_iocap_queue_complete_one(struct vtblk_iocap_softc *sc, struct vtblk_iocap_
 	if (req->vbr_mapp != NULL) {
 		switch (bp->bio_cmd) {
 		case BIO_READ:
-			bus_dmamap_sync(sc->vtblk_iocap_dmat, req->vbr_mapp,
+			bus_dmamap_sync((bus_dma_tag_t)sc->vtblk_iocap_request_tag, req->vbr_mapp,
 			    BUS_DMASYNC_POSTREAD);
-			bus_dmamap_unload(sc->vtblk_iocap_dmat, req->vbr_mapp);
+			bus_dmamap_unload((bus_dma_tag_t)sc->vtblk_iocap_request_tag, req->vbr_mapp);
 			break;
 		case BIO_WRITE:
-			bus_dmamap_sync(sc->vtblk_iocap_dmat, req->vbr_mapp,
+			bus_dmamap_sync((bus_dma_tag_t)sc->vtblk_iocap_request_tag, req->vbr_mapp,
 			    BUS_DMASYNC_POSTWRITE);
-			bus_dmamap_unload(sc->vtblk_iocap_dmat, req->vbr_mapp);
+			bus_dmamap_unload((bus_dma_tag_t)sc->vtblk_iocap_request_tag, req->vbr_mapp);
 			break;
 		}
 	}

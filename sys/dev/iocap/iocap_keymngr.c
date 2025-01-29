@@ -55,7 +55,11 @@ struct bus_dma_iocap_enabled_tag {
 	enum iocap_keymngr_revocation_mode revocation_mode;
 	uint8_t n_keys;
 	uint8_t allocated_keys[MAX_NUM_KEYS_PER_TAG];
-	uint8_t key_refcounts[MAX_NUM_KEYS_PER_TAG];
+	// TODO how big does this have to be :sweat_smile:
+	// virtio preallocates more than 255 dmamaps per tag lol
+	// this particular case will not be for much longer, once we move to refcounting-keys-on-load rather than refcounting-keys-on-create-map
+	// but it's still something to think about
+	uint64_t key_refcounts[MAX_NUM_KEYS_PER_TAG];
 	// TODO more complicated mapping tracking, epochs?
 	int32_t map_count;
 };
@@ -156,7 +160,7 @@ static bus_get_dma_tag_t iocap_keymngr_get_dma_tag;
 
 struct iocap_key_state {
 	// TODO a lock
-	CCapU128 key_data;
+	CCapU128 key_data __aligned(4);
 	// Is this key currently assigned to a tag
 	bool allocated;
 	// Does the key currently have usable contents i.e. can it be used to mint iocaps
@@ -324,6 +328,7 @@ iocap_keymngr_attach(device_t dev)
 	sc->available_keys = 256;
 	// The key allocator is very simple: if available_keys >= 1, increment
 	// last_allocated_key until !sc->keys[last_allocated_key].allocated.
+	// Set last_allocated_key = 0xFF so that +1 => 0
 	sc->last_allocated_key = 0xFF;
 
 	iocap_keymngr_dbg_perfcounters(dev);
@@ -423,6 +428,8 @@ static int iocap_keymngr_alloc_key_ids(device_t dev, uint8_t *key_ids,
 		// TODO release lock on key
 
 		key_ids[i] = sc->last_allocated_key;
+
+		device_printf(dev, "allocated key %d for #%d of a tag\n", sc->last_allocated_key, i);
 	}
 
 	// TODO unlock key manager
@@ -449,10 +456,14 @@ static void iocap_keymngr_init_key(device_t dev, uint8_t key_id)
 	arc4random_buf(sc->keys[key_id].key_data, 16);
 	sc->keys[key_id].active = true;
 	// Write the key data into the MMIO device
-	// TODO assuming it's safe to cast the data to uint32_t. Need to ensure alignment
-	bus_space_write_multi_4(sc->bst, sc->bsh, 0x1000 + (key_id << 4),
-		(uint32_t*)sc->keys[key_id].key_data, 4);
-	// TODO memory barrier?
+	// key_data is aligned to 4-bytes so we can cast the pointer to uint32
+	// bus_space_write_multi etc. are not implemented for this specific bus_space... bleh
+	for (int i = 0; i < 4; i++)
+		bus_space_write_4(sc->bst, sc->bsh,
+			0x1000 + (key_id << 4) + (i << 2),
+			((uint32_t*)sc->keys[key_id].key_data)[i]);
+	// TODO memory barrier needed?
+	mb();
 	// Set the key status in the MMIO device as 1
 	bus_space_write_4(sc->bst, sc->bsh, 0x0 + (key_id << 4), 1);
 
@@ -559,6 +570,10 @@ iocap_enabled_tag_inc_refcount(bus_dma_iocap_enabled_tag_t tag,
 {
 	// TODO take a lock on the tag
 	tag->key_refcounts[nth_key_of_tag]++;
+	KASSERT(tag->key_refcounts[nth_key_of_tag] != 0,
+		("%s - overflowed refcount for key %d of tag %p",
+			device_get_name(tag->iocap_keymngr), nth_key_of_tag,
+			tag));
 	if (tag->key_refcounts[nth_key_of_tag] == 1) {
 		iocap_keymngr_init_key(tag->iocap_keymngr,
 				tag->allocated_keys[nth_key_of_tag]);
@@ -864,6 +879,9 @@ iocap_enabled_tag_destroy(bus_dma_tag_t dmat)
 	int error;
 
 	iocap_dmat = (struct bus_dma_iocap_enabled_tag *)dmat;
+
+	// device_printf(iocap_dmat->iocap_keymngr, "%s\n", __func__);
+
 	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
 	error = 0;
 
@@ -887,6 +905,9 @@ iocap_enabled_map_create(bus_dma_tag_t dmat, int flags, bus_dmamap_t *mapp)
 	int error;
 
 	iocap_dmat = (struct bus_dma_iocap_enabled_tag *)dmat;
+
+	// device_printf(iocap_dmat->iocap_keymngr, "%s\n", __func__);
+
 	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
 	iocap_map = _iocap_enabled_create_map_common(iocap_dmat);
 	error = 0;
@@ -912,6 +933,9 @@ iocap_enabled_map_destroy(bus_dma_tag_t dmat, bus_dmamap_t map)
 	int error;
 
 	iocap_dmat = (struct bus_dma_iocap_enabled_tag *)dmat;
+
+	// device_printf(iocap_dmat->iocap_keymngr, "%s\n", __func__);
+
 	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
 	iocap_map = (struct bus_iocap_dmamap *)map;
 
@@ -932,6 +956,9 @@ iocap_enabled_mem_alloc(bus_dma_tag_t dmat, void **vaddr, int flags,
 	struct bus_iocap_dmamap *iocap_map;
 
 	iocap_dmat = (struct bus_dma_iocap_enabled_tag *)dmat;
+
+	// device_printf(iocap_dmat->iocap_keymngr, "%s\n", __func__);
+
 	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
 	iocap_map = _iocap_enabled_create_map_common(iocap_dmat);
 
@@ -957,6 +984,9 @@ iocap_enabled_mem_free(bus_dma_tag_t dmat, void *vaddr, bus_dmamap_t map)
 	struct bus_iocap_dmamap *iocap_map;
 
 	iocap_dmat = (struct bus_dma_iocap_enabled_tag *)dmat;
+
+	// device_printf(iocap_dmat->iocap_keymngr, "%s\n", __func__);
+
 	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
 	iocap_map = (struct bus_iocap_dmamap *)map;
 
@@ -977,6 +1007,9 @@ iocap_enabled_load_ma(bus_dma_tag_t dmat, bus_dmamap_t map,
 	struct bus_iocap_dmamap *iocap_map;
 
 	iocap_dmat = (struct bus_dma_iocap_enabled_tag *)dmat;
+
+	// device_printf(iocap_dmat->iocap_keymngr, "%s\n", __func__);
+
 	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
 	iocap_map = (struct bus_iocap_dmamap *)map;
 
@@ -999,6 +1032,9 @@ iocap_enabled_load_phys(bus_dma_tag_t dmat, bus_dmamap_t map,
 	struct bus_iocap_dmamap *iocap_map;
 
 	iocap_dmat = (struct bus_dma_iocap_enabled_tag *)dmat;
+
+	// device_printf(iocap_dmat->iocap_keymngr, "%s\n", __func__);
+
 	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
 	iocap_map = (struct bus_iocap_dmamap *)map;
 
@@ -1021,6 +1057,9 @@ iocap_enabled_load_buffer(bus_dma_tag_t dmat, bus_dmamap_t map,
 	struct bus_iocap_dmamap *iocap_map;
 
 	iocap_dmat = (struct bus_dma_iocap_enabled_tag *)dmat;
+
+	// device_printf(iocap_dmat->iocap_keymngr, "%s\n", __func__);
+
 	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
 	iocap_map = (struct bus_iocap_dmamap *)map;
 
@@ -1043,6 +1082,9 @@ iocap_enabled_map_waitok(bus_dma_tag_t dmat, bus_dmamap_t map,
 	struct bus_iocap_dmamap *iocap_map;
 
 	iocap_dmat = (struct bus_dma_iocap_enabled_tag *)dmat;
+
+	// device_printf(iocap_dmat->iocap_keymngr, "%s\n", __func__);
+
 	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
 	iocap_map = (struct bus_iocap_dmamap *)map;
 
@@ -1064,6 +1106,9 @@ iocap_enabled_map_complete(bus_dma_tag_t dmat, bus_dmamap_t map,
 	struct bus_iocap_dmamap *iocap_map;
 
 	iocap_dmat = (struct bus_dma_iocap_enabled_tag *)dmat;
+
+	// device_printf(iocap_dmat->iocap_keymngr, "%s\n", __func__);
+
 	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
 	iocap_map = (struct bus_iocap_dmamap *)map;
 
@@ -1083,6 +1128,9 @@ iocap_enabled_map_unload(bus_dma_tag_t dmat, bus_dmamap_t map)
 	struct bus_iocap_dmamap *iocap_map;
 
 	iocap_dmat = (struct bus_dma_iocap_enabled_tag *)dmat;
+
+	// device_printf(iocap_dmat->iocap_keymngr, "%s\n", __func__);
+
 	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
 	iocap_map = (struct bus_iocap_dmamap *)map;
 
@@ -1102,6 +1150,9 @@ iocap_enabled_map_sync(bus_dma_tag_t dmat, bus_dmamap_t map,
 	struct bus_iocap_dmamap *iocap_map;
 
 	iocap_dmat = (struct bus_dma_iocap_enabled_tag *)dmat;
+
+	// device_printf(iocap_dmat->iocap_keymngr, "%s\n", __func__);
+
 	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
 	iocap_map = (struct bus_iocap_dmamap *)map;
 
@@ -1177,8 +1228,13 @@ bus_dma_tag_refine_to_iocap_group(bus_dma_iocap_refinable_tag_t tag,
 
 	new_tag->common.impl = &bus_dma_iocap_enabled_tag_impl;
 	new_tag->base_tag = tag->base_tag;
+	new_tag->iocap_keymngr = tag->iocap_keymngr;
 	new_tag->revocation_mode = params.mode;
 	new_tag->n_keys = params.n_keys;
+	// TODO lol what is the C99 syntax for zero-init
+	// new_tag->allocated_keys = {0};
+	// new_tag->key_refcounts = {0};
+	new_tag->map_count = 0;
 
 	int error = iocap_keymngr_alloc_key_ids(tag->iocap_keymngr,
 			new_tag->allocated_keys, params.n_keys);

@@ -1,6 +1,7 @@
 #ifndef IOCAP_KEYMNGR_H
 #define IOCAP_KEYMNGR_H
 
+#include <sys/bus_dma.h>
 #include <dev/iocap/iocap.h>
 
 // ======= IOCap DMA Tags =======
