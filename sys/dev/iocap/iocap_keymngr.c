@@ -211,7 +211,13 @@ EARLY_DRIVER_MODULE(iocap_keymngr, simplebus, iocap_keymngr_driver, 0, 0,
 		BUS_PASS_BUS + BUS_PASS_ORDER_MIDDLE);
 
 
+// device_printf the value of all performance counters
 static void iocap_keymngr_dbg_perfcounters(device_t);
+// sysctl-compatible function for reading performance counters through MMIO.
+// Takes a iocap_keymngr_softc* in arg1, and an address to u64-read in arg2.
+// SYSCTL_ADD_PROC is employed to ensure that arg2 is always 0x1000, 0x1008, 0x1010, or 0x1018.
+// IT WOULD BE BAD IF SOMEONE PASSED A DIFFERENT VALUE IN. IS THAT POSSIBLE?
+static int iocap_keymngr_dbg_perfcounters_sysctl(SYSCTL_HANDLER_ARGS);
 
 // Assign n_key_ids key IDs to a tag, without reusing key IDs already assigned to other tags
 static int iocap_keymngr_alloc_key_ids(device_t, uint8_t *key_ids,
@@ -331,6 +337,38 @@ iocap_keymngr_attach(device_t dev)
 	// Set last_allocated_key = 0xFF so that +1 => 0
 	sc->last_allocated_key = 0xFF;
 
+	// Add the sysctls
+	struct sysctl_ctx_list *ctx;
+	struct sysctl_oid *tree;
+	struct sysctl_oid_list *child;
+
+	// Not sure what this is - got it from virtio_blk.c
+	ctx = device_get_sysctl_ctx(dev);
+	tree = device_get_sysctl_tree(dev);
+	child = SYSCTL_CHILDREN(tree);
+
+	// Add a function-based sysctl called good_read
+	// whireh returns a U64, is read-only, and multiprocess-safe(?)
+	// which calls iocap_keymngr_dbg_perfcounters_sysctl(sc, 0x1000)
+	// which returns a U64 (or a 'QU').
+	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "good_read",
+	    CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0x1000,
+	    iocap_keymngr_dbg_perfcounters_sysctl, "QU",
+	    "Number of correct IOCap reads handled by the key manager");
+	// Ditto for the rest
+	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "bad_read",
+	    CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0x1008,
+	    iocap_keymngr_dbg_perfcounters_sysctl, "QU",
+	    "Number of incorrect IOCap reads handled by the key manager");
+	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "good_write",
+	    CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0x1010,
+	    iocap_keymngr_dbg_perfcounters_sysctl, "QU",
+	    "Number of correct IOCap writes handled by the key manager");
+	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "bad_write",
+	    CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0x1018,
+	    iocap_keymngr_dbg_perfcounters_sysctl, "QU",
+	    "Number of incorrect IOCap writes handled by the key manager");
+
 	iocap_keymngr_dbg_perfcounters(dev);
 
 	// TODO setup lock
@@ -393,6 +431,22 @@ iocap_keymngr_dbg_perfcounters(device_t dev)
 	uint64_t bad_write = bus_space_read_8(sc->bst, sc->bsh, 0x1018);
 	device_printf(dev, "perf counters: %ld %ld %ld %ld\n", good_read,
 			bad_read, good_write, bad_write);
+}
+
+static int
+iocap_keymngr_dbg_perfcounters_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct iocap_keymngr_softc *sc;
+	bus_size_t address;
+	uint64_t value;
+	int error;
+
+	sc = arg1;
+	address = arg2;
+	value = bus_space_read_8(sc->bst, sc->bsh, address);
+	error = sysctl_handle_64(oidp, &value, 0, req);
+
+	return error;
 }
 
 // Assign n_key_ids key IDs to a tag, without reusing key IDs already assigned to other tags
@@ -1352,6 +1406,22 @@ bus_dmamap_mint_virtio_iocap(bus_iocap_dmamap_t map, bus_dma_segment_t *segment,
 				key,
 				&desc,
 				key_id);
+
+		// device_printf(map->tag->iocap_keymngr, "minting (data %02x%02x%02x%02x) (sig %02x%02x%02x%02x) for key_id %d (%02x%02x%02x%02x)\n",
+		// 	out->cap.data[3],
+		// 	out->cap.data[2],
+		// 	out->cap.data[1],
+		// 	out->cap.data[0],
+		// 	out->cap.signature[3],
+		// 	out->cap.signature[2],
+		// 	out->cap.signature[1],
+		// 	out->cap.signature[0],
+		// 	key_id,
+		// 	(*key)[3],
+		// 	(*key)[2],
+		// 	(*key)[1],
+		// 	(*key)[0]
+		// );
 	}
 
 	iocap_keymngr_unlock_key(map->tag->iocap_keymngr, key_id);
