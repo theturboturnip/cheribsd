@@ -86,6 +86,18 @@ int vtmmio_attach(device_t);
 #define	VIRTIO_MMIO_QUEUE_AVAIL_HIGH	0x094	/* requires version 2 */
 #define	VIRTIO_MMIO_QUEUE_USED_LOW	0x0a0	/* requires version 2 */
 #define	VIRTIO_MMIO_QUEUE_USED_HIGH	0x0a4	/* requires version 2 */
+
+/* Selected queue's IOCap, 256 bits in 8 components.
+ * Always available, only used if VIRTIO_F_IOCAP_QUEUE feature enabled. */
+#define VIRTIO_MMIO_QUEUE_IOCAP_TXT_WORD0   0x0c0
+#define VIRTIO_MMIO_QUEUE_IOCAP_TXT_WORD1   0x0c4
+#define VIRTIO_MMIO_QUEUE_IOCAP_TXT_WORD2   0x0c8
+#define VIRTIO_MMIO_QUEUE_IOCAP_TXT_WORD3   0x0cc
+#define VIRTIO_MMIO_QUEUE_IOCAP_SIG_WORD0   0x0d0
+#define VIRTIO_MMIO_QUEUE_IOCAP_SIG_WORD1   0x0d4
+#define VIRTIO_MMIO_QUEUE_IOCAP_SIG_WORD2   0x0d8
+#define VIRTIO_MMIO_QUEUE_IOCAP_SIG_WORD3   0x0dc
+
 #define	VIRTIO_MMIO_CONFIG_GENERATION	0x0fc	/* requires version 2 */
 #define	VIRTIO_MMIO_CONFIG		0x100
 #define	VIRTIO_MMIO_MAGIC_VIRT		0x74726976

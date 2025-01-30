@@ -6,7 +6,7 @@
 #include "libccap/libccap.h"
 
 struct iocap {
-    CCap2024_11 cap;
+    CCap2024_11 cap __aligned(4);
 };
 
 inline uint16_t iocap_virtio_get_encoded_next(struct iocap* iocap)

@@ -570,7 +570,7 @@ vtmmio_set_virtqueue(struct vtmmio_softc *sc, struct virtqueue *vq,
 
 static void
 vtmmio_set_virtqueue_iocap(struct vtmmio_softc *sc, struct virtq_iocap *vq,
-	uint32_t size)
+	struct iocap* iocap, uint32_t size)
 {
 	vm_paddr_t paddr;
 
@@ -601,7 +601,24 @@ vtmmio_set_virtqueue_iocap(struct vtmmio_softc *sc, struct virtq_iocap *vq,
 		vtmmio_write_config_4(sc, VIRTIO_MMIO_QUEUE_USED_HIGH,
 		    ((uint64_t)paddr) >> 32);
 
-		// TODO write out the actual iocap contents
+		// Write out the queue IOCap
+		vtmmio_write_config_4(sc, VIRTIO_MMIO_QUEUE_IOCAP_SIG_WORD0,
+		    ((uint32_t*)&iocap->cap.signature)[0]);
+		vtmmio_write_config_4(sc, VIRTIO_MMIO_QUEUE_IOCAP_SIG_WORD1,
+		    ((uint32_t*)&iocap->cap.signature)[1]);
+		vtmmio_write_config_4(sc, VIRTIO_MMIO_QUEUE_IOCAP_SIG_WORD2,
+		    ((uint32_t*)&iocap->cap.signature)[2]);
+		vtmmio_write_config_4(sc, VIRTIO_MMIO_QUEUE_IOCAP_SIG_WORD3,
+		    ((uint32_t*)&iocap->cap.signature)[3]);
+		vtmmio_write_config_4(sc, VIRTIO_MMIO_QUEUE_IOCAP_TXT_WORD0,
+		    ((uint32_t*)&iocap->cap.data)[0]);
+		vtmmio_write_config_4(sc, VIRTIO_MMIO_QUEUE_IOCAP_TXT_WORD1,
+		    ((uint32_t*)&iocap->cap.data)[1]);
+		vtmmio_write_config_4(sc, VIRTIO_MMIO_QUEUE_IOCAP_TXT_WORD2,
+		    ((uint32_t*)&iocap->cap.data)[2]);
+		vtmmio_write_config_4(sc, VIRTIO_MMIO_QUEUE_IOCAP_TXT_WORD3,
+		    ((uint32_t*)&iocap->cap.data)[3]);
+
 
 		vtmmio_write_config_4(sc, VIRTIO_MMIO_QUEUE_READY, 1);
 	}
@@ -808,7 +825,7 @@ vtmmio_alloc_iocap_virtqueues(device_t dev,
 		}
 
 		// we can assume the callback successfully completed.
-		vtmmio_set_virtqueue_iocap(sc, vq, size);
+		vtmmio_set_virtqueue_iocap(sc, vq, &vqx->iocap, size);
 
 		sc->vtmmio_nvqs++;
 	}
