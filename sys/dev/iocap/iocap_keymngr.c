@@ -60,6 +60,7 @@ struct bus_dma_iocap_enabled_tag {
 	// this particular case will not be for much longer, once we move to refcounting-keys-on-load rather than refcounting-keys-on-create-map
 	// but it's still something to think about
 	uint64_t key_refcounts[MAX_NUM_KEYS_PER_TAG];
+	uint64_t key_max_refcounts[MAX_NUM_KEYS_PER_TAG];
 	// TODO more complicated mapping tracking, epochs?
 	int32_t map_count;
 };
@@ -243,17 +244,19 @@ static void iocap_keymngr_free_key_ids(device_t, uint8_t const *key_ids,
 		uint8_t n_key_ids);
 
 
-// Increment the refcount for a key on a given tag.
+// Assign a key within a tag for a map.
+// Increment the refcount for that key on the given tag.
 // If the refcount increases from zero for that key call iocap_keymngr_init_key.
 static int
-iocap_enabled_tag_inc_refcount(bus_dma_iocap_enabled_tag_t tag,
-		uint8_t nth_key_of_tag);
+iocap_enabled_tag_assign_key(bus_dma_iocap_enabled_tag_t tag,
+		bus_iocap_dmamap_t map);
 
-// Decremnt the refcount for a key on a given tag.
+// Unassign a key from a map within a tag.
+// Decremnt the refcount for a key on the given tag.
 // When the refcount hits zero, call iocap_keymngr_clear_key to clear the key data but keep the key index allocated.
 static int
-iocap_enabled_tag_dec_refcount(bus_dma_iocap_enabled_tag_t tag,
-		uint8_t nth_key_of_tag);
+iocap_enabled_tag_unassign_key(bus_dma_iocap_enabled_tag_t tag,
+		bus_iocap_dmamap_t map);
 
 
 static int
@@ -619,36 +622,68 @@ static void iocap_keymngr_free_key_ids(device_t dev, uint8_t const *key_ids,
 // Increment the refcount for a key on a given tag.
 // If the refcount increases from zero for that key call iocap_keymngr_init_key.
 static int
-iocap_enabled_tag_inc_refcount(bus_dma_iocap_enabled_tag_t tag,
-		uint8_t nth_key_of_tag)
+iocap_enabled_tag_assign_key(bus_dma_iocap_enabled_tag_t tag,
+		bus_iocap_dmamap_t map)
 {
+	// TODO take a lock on the map
+
 	// TODO take a lock on the tag
+
+	// TODO depending on revocation strategy we should change this
+	uint8_t nth_key_of_tag = 0;
+	map->nth_key_of_tag = nth_key_of_tag;
+	KASSERT(map->state != iocap_dmamap_loaded,
+			("Tried to complete a DMA map after it was completed"));
+	map->state = iocap_dmamap_loaded;
+
 	tag->key_refcounts[nth_key_of_tag]++;
 	KASSERT(tag->key_refcounts[nth_key_of_tag] != 0,
 		("%s - overflowed refcount for key %d of tag %p",
 			device_get_name(tag->iocap_keymngr), nth_key_of_tag,
 			tag));
-	if (tag->key_refcounts[nth_key_of_tag] == 1) {
-		iocap_keymngr_init_key(tag->iocap_keymngr,
-				tag->allocated_keys[nth_key_of_tag]);
+	if (tag->key_max_refcounts[nth_key_of_tag] < tag->key_refcounts[nth_key_of_tag]) {
+		tag->key_max_refcounts[nth_key_of_tag]++;
 	}
+	if (tag->key_refcounts[nth_key_of_tag] == 1) {
+		uint8_t key_id = tag->allocated_keys[nth_key_of_tag];
+		device_printf(tag->iocap_keymngr, "Activating IOCap key %d\n", key_id);
+		iocap_keymngr_init_key(tag->iocap_keymngr, key_id);
+	}
+
 	// TODO release lock on tag
+	// TODO release lock on map
 	return 0;
 }
 
 // Decremnt the refcount for a key on a given tag.
 // When the refcount hits zero, call iocap_keymngr_clear_key to clear the key data but keep the key index allocated.
 static int
-iocap_enabled_tag_dec_refcount(bus_dma_iocap_enabled_tag_t tag,
-		uint8_t nth_key_of_tag)
+iocap_enabled_tag_unassign_key(bus_dma_iocap_enabled_tag_t tag,
+		bus_iocap_dmamap_t map)
 {
+	// TODO take a lock on the map
 	// TODO take a lock on the tag
+
+	KASSERT(map->state == iocap_dmamap_loaded,
+			("Tried to unload a DMA map when it was not loaded"));
+
+	uint8_t nth_key_of_tag = map->nth_key_of_tag;
 	tag->key_refcounts[nth_key_of_tag]--;
 	if (tag->key_refcounts[nth_key_of_tag] == 0) {
-		iocap_keymngr_clear_key(tag->iocap_keymngr,
-				tag->allocated_keys[nth_key_of_tag]);
+		uint8_t key_id = tag->allocated_keys[nth_key_of_tag];
+		device_printf(tag->iocap_keymngr,
+				"Deactivating IOCap key %d with max refcount %zu\n",
+				key_id, tag->key_max_refcounts[nth_key_of_tag]);
+		iocap_keymngr_clear_key(tag->iocap_keymngr, key_id);
+
+		tag->key_max_refcounts[nth_key_of_tag] = 0;
 	}
+
+	map->nth_key_of_tag = 0xFF;
+	map->state = iocap_dmamap_unloaded;
+
 	// TODO release lock on tag
+	// TODO release lock on map
 	return 0;
 }
 
@@ -872,38 +907,35 @@ struct bus_dma_impl bus_dma_iocap_refinable_tag_impl = {
 	.map_sync = refinable_map_sync
 };
 
-// TODO don't increment the refcount on create/destroy!
-// TODO increment the refcount on load/unload!
-
-// malloc-s a struct bus_iocap_dmamap, populating all fields except the base_map
-// and incrementing the refcount for the relevent key.
+// malloc-s a struct bus_iocap_dmamap, populating all fields except the base_map.
 static bus_iocap_dmamap_t
 _iocap_enabled_create_map_common(bus_dma_iocap_enabled_tag_t tag)
 {
 	bus_iocap_dmamap_t map;
 
-	uint8_t nth_key_of_tag = 0;
-	// TODO depending on revocation strategy we should change this
-	iocap_enabled_tag_inc_refcount(tag, nth_key_of_tag);
-
 	map = malloc(sizeof(*map), M_IOCAP_DMAMAP, M_NOWAIT | M_ZERO);
 	map->magic = BUS_IOCAP_DMAMAP_MAGIC;
 	map->state = iocap_dmamap_unloaded;
 	map->tag = tag;
-	map->nth_key_of_tag = nth_key_of_tag;
+	map->nth_key_of_tag = 0xFF; // invalid, not set yet because we are unloaded
 
 	// TODO does each map need a lock?
 
 	return map;
 }
 
-// free-s a struct bus_iocap_dmamap, assuming the base_map has already been freed
-// and decrementing the refcount for the relevant key
+// free-s a struct bus_iocap_dmamap, assuming the base_map has already been freed.
+// If it still has contents loaded, it decrements the refcount for the relevant key.
+// This should never happen.
+// TODO need to make sure the transisiton from loaded -> unloaded and decrementing the key is altogether atomic
 static void
 _iocap_enabled_destroy_map_common(bus_dma_iocap_enabled_tag_t tag,
 		bus_iocap_dmamap_t map)
 {
-	iocap_enabled_tag_dec_refcount(tag, map->nth_key_of_tag);
+	if (map->state == iocap_dmamap_loaded) {
+		device_printf(tag->iocap_keymngr, "Destroying an IOCap map that hadn't been unloaded?");
+		iocap_enabled_tag_unassign_key(tag, map);
+	}
 
 	// TODO if we end up putting a lock in each dmamap like IOMMU does, destroy it here
 
@@ -1151,6 +1183,8 @@ iocap_enabled_map_waitok(bus_dma_tag_t dmat, bus_dmamap_t map,
 			callback, callback_arg);
 }
 
+// Finish loading memory into the IOCap. Allocates a key from the parent tag
+// now that we are exposing memory.
 static bus_dma_segment_t *
 iocap_enabled_map_complete(bus_dma_tag_t dmat, bus_dmamap_t map,
 		bus_dma_segment_t *segs, int nsegs, int error)
@@ -1166,9 +1200,8 @@ iocap_enabled_map_complete(bus_dma_tag_t dmat, bus_dmamap_t map,
 	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
 	iocap_map = (struct bus_iocap_dmamap *)map;
 
-	KASSERT(iocap_map->state != iocap_dmamap_loaded,
-			("Tried to complete a DMA map after it was completed"));
-	iocap_map->state = iocap_dmamap_loaded;
+	// Transitions the map to "loaded" state
+	iocap_enabled_tag_assign_key(iocap_dmat, iocap_map);
 
 	return base_impl->map_complete(iocap_dmat->base_tag,
 			iocap_map->base_map, segs, nsegs, error);
@@ -1188,9 +1221,8 @@ iocap_enabled_map_unload(bus_dma_tag_t dmat, bus_dmamap_t map)
 	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
 	iocap_map = (struct bus_iocap_dmamap *)map;
 
-	KASSERT(iocap_map->state == iocap_dmamap_loaded,
-			("Tried to unload a DMA map when it was not loaded"));
-	iocap_map->state = iocap_dmamap_unloaded;
+	// Transitions map to unloaded
+	iocap_enabled_tag_unassign_key(iocap_dmat, iocap_map);
 
 	base_impl->map_unload(iocap_dmat->base_tag, iocap_map->base_map);
 }
@@ -1332,6 +1364,10 @@ bus_dmamap_mint_iocap(bus_iocap_dmamap_t map, bus_dma_segment_t *segment,
 	if (!bus_dmamap_can_mint_iocap((bus_dmamap_t)map)) {
 		return EPERM;
 	}
+	if (map->state != iocap_dmamap_loaded) {
+		// The key_id stored in the map may not be valid
+		return EPERM;
+	}
 
 	uint8_t key_id;
 	CCapU128 *key;
@@ -1378,6 +1414,10 @@ bus_dmamap_mint_virtio_iocap(bus_iocap_dmamap_t map, bus_dma_segment_t *segment,
 		uint16_t flags, uint16_t next, struct iocap *out)
 {
 	if (!bus_dmamap_can_mint_iocap((bus_dmamap_t)map)) {
+		return EPERM;
+	}
+	if (map->state != iocap_dmamap_loaded) {
+		// The key_id stored in the map may not be valid
 		return EPERM;
 	}
 
