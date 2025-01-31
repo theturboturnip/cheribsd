@@ -712,7 +712,7 @@ static void vtmmio_handle_dmamapped_iocap_virtqueue(void* arg, bus_dma_segment_t
 		return;
 	}
 
-	error = bus_dmamap_mint_virtio_iocap(vqx->mapping, segs, 0, 0, &vqx->iocap);
+	error = bus_dmamap_mint_iocap(vqx->mapping, segs, CCapPerms_ReadWrite, &vqx->iocap);
 	if (error) {
 		device_printf(vqx->vtmmio,
 		    "cannot generate iocap for iocap virtqueue: %d\n",
