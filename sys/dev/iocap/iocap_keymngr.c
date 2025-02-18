@@ -161,7 +161,7 @@ static bus_get_dma_tag_t iocap_keymngr_get_dma_tag;
 
 struct iocap_key_state {
 	// TODO a lock
-	CCapU128 key_data __aligned(4);
+	CCapU128 key_data __aligned(8);
 	// Is this key currently assigned to a tag
 	bool allocated;
 	// Does the key currently have usable contents i.e. can it be used to mint iocaps
@@ -513,16 +513,20 @@ static void iocap_keymngr_init_key(device_t dev, uint8_t key_id)
 	arc4random_buf(sc->keys[key_id].key_data, 16);
 	sc->keys[key_id].active = true;
 	// Write the key data into the MMIO device
-	// key_data is aligned to 4-bytes so we can cast the pointer to uint32
+	// key_data is aligned to 8-bytes so we can cast the pointer to uint64
 	// bus_space_write_multi etc. are not implemented for this specific bus_space... bleh
-	for (int i = 0; i < 4; i++)
-		bus_space_write_4(sc->bst, sc->bsh,
+	for (int i = 0; i < 2; i++) {
+		uint64_t* key_as_64bits = (uint64_t*)sc->keys[key_id].key_data;
+		uint64_t key_i = key_as_64bits[i];
+		bus_space_write_8(sc->bst, sc->bsh,
 			0x1000 + (key_id << 4) + (i << 2),
-			((uint32_t*)sc->keys[key_id].key_data)[i]);
+			key_i);
+	}
+
 	// TODO memory barrier needed?
 	mb();
 	// Set the key status in the MMIO device as 1
-	bus_space_write_4(sc->bst, sc->bsh, 0x0 + (key_id << 4), 1);
+	bus_space_write_8(sc->bst, sc->bsh, 0x0 + (key_id << 4), 1);
 
 	// TODO release lock on key
 }
@@ -571,12 +575,12 @@ static void iocap_keymngr_clear_key(device_t dev, uint8_t key_id)
 		("Key %d must be active to clear it", key_id));
 
 	// Tell device to start revoking as early as possible
-	bus_space_write_4(sc->bst, sc->bsh, 0x0 + (key_id << 4), 0);
+	bus_space_write_8(sc->bst, sc->bsh, 0x0 + (key_id << 4), 0);
 	// Clear data out
 	memset(sc->keys[key_id].key_data, 0, 16);
 	sc->keys[key_id].active = false;
 	// Check the MMIO device has actually revoked
-	while (bus_space_read_4(sc->bst, sc->bsh, 0x0 + (key_id << 4)) != 0) {
+	while (bus_space_read_8(sc->bst, sc->bsh, 0x0 + (key_id << 4)) != 0) {
 		// wait until the MMIO device confirms revocation with
 		// key status == 0
 	}
