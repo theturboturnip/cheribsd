@@ -519,7 +519,7 @@ static void iocap_keymngr_init_key(device_t dev, uint8_t key_id)
 		uint64_t* key_as_64bits = (uint64_t*)sc->keys[key_id].key_data;
 		uint64_t key_i = key_as_64bits[i];
 		bus_space_write_8(sc->bst, sc->bsh,
-			0x1000 + (key_id << 4) + (i << 2),
+			0x1000 + (key_id << 4) + (i << 3),
 			key_i);
 	}
 
