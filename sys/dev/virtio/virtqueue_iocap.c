@@ -705,7 +705,7 @@ vq_iocap_ring_init(struct virtq_iocap *vq)
 
 	vring_iocap_init(vr, size, ring_mem, vq->vq_alignment);
 
-	for (i = 0; i < vq->vq_max_indirect_size - 1; i++) {
+	for (i = 0; i < size - 1; i++) {
 		res = clear_iocap_virtio_except_next(&vr->desc[i], i + 1);
 		VQASSERT_CCAPRESULT(vq, res, "vq_iocap_ring_init");
 	}
