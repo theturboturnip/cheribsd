@@ -935,8 +935,13 @@ pmap_bootstrap(vm_paddr_t kernstart, vm_size_t kernlen)
 	 */
 	freeva = freemempos - kernstart + KERNBASE;
 #ifdef __CHERI_PURE_CAPABILITY__
-	freeva = (vm_pointer_t)cheri_setbounds(cheri_setaddress(
-	    kernel_root_cap, freeva), VM_MAX_KERNEL_ADDRESS - freeva);
+	freeva = (vm_pointer_t)cheri_setaddress(
+	    cheri_setbounds(
+	    	cheri_setaddress(kernel_root_cap, VM_MIN_KERNEL_ADDRESS),
+	    	VM_MAX_KERNEL_ADDRESS - VM_MIN_KERNEL_ADDRESS
+	    ),
+	    freeva
+	);
 #endif
 #ifdef __CHERI_PURE_CAPABILITY__
 #define reserve_space(var, pa, size)					\
