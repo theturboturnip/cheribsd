@@ -937,6 +937,7 @@ vq_iocap_ring_free_chain(struct virtq_iocap *vq, uint16_t desc_idx)
 			uint16_t next_idx = iocap_virtio_get_encoded_next(iocap);
 			VQ_IOCAP_RING_ASSERT_VALID_IDX(vq, next_idx);
 			iocap = &vq->vq_ring.desc[next_idx];
+			flags = iocap_virtio_get_indirect_next_flags(iocap);
 			dxp->ndescs--;
 		}
 	}
