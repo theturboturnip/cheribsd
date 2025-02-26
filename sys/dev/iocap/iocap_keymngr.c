@@ -1158,6 +1158,14 @@ iocap_enabled_load_buffer(bus_dma_tag_t dmat, bus_dmamap_t map,
 	));
 	iocap_map->state = iocap_dmamap_loading;
 
+	device_printf(iocap_dmat->iocap_keymngr, "iocap_enabled_load_buffer buf %p buflen 0x%lx\n", buf, buflen);
+
+	// TODO the default riscv bounce buffer implementation may pad the dmasegments out to 4KiB multiples.
+	// This is only in the case where addr_needs_bounce(dmat, curaddr): see busdma_bounce.c:673
+	// This discards the (very important!) raw size information that we need
+	// to generate tight IOcaps.
+	// This may be fixable by changing the alignment restrictions implied by the virtio blk driver,
+	// which control the outcome of addr_needs_bounce.
 	return base_impl->load_buffer(iocap_dmat->base_tag, iocap_map->base_map,
 			buf, buflen, pmap, flags, segs, segp);
 }
