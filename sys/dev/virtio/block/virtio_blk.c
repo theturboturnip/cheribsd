@@ -385,7 +385,7 @@ vtblk_attach(device_t dev)
 	 * align to a page boundary so we can send a *contiguous* page size
 	 * request to the host.
 	 */
-	if (sc->vtblk_max_nsegs == VTBLK_MIN_SEGMENTS + 1)
+	if (true || sc->vtblk_max_nsegs == VTBLK_MIN_SEGMENTS + 1)
 		sc->vtblk_flags |= VTBLK_FLAG_BUSDMA_ALIGN;
 	error = bus_dma_tag_create(
 	    bus_get_dma_tag(dev),			/* parent */
