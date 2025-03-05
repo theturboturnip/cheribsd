@@ -541,8 +541,8 @@ _bus_dmamap_count_pages(bus_dma_tag_t dmat, bus_dmamap_t map, pmap_t pmap,
 			else
 				paddr = pmap_extract(pmap, vaddr);
 			if (addr_needs_bounce(dmat, paddr)) {
-				sg_len = roundup2(sg_len,
-				    dmat->common.alignment);
+				// sg_len = roundup2(sg_len,
+				//     dmat->common.alignment);
 				map->pagesneeded++;
 			}
 			vaddr += sg_len;
@@ -668,10 +668,12 @@ bounce_bus_dmamap_load_buffer(bus_dma_tag_t dmat, bus_dmamap_t map, void *buf,
 		 * Compute the segment size, and adjust counts.
 		 */
 		sgsize = MIN(buflen, PAGE_SIZE - (curaddr & PAGE_MASK));
+		KASSERT(buflen >= sgsize,
+			("Segment length overruns original buffer"));
 		if (((dmat->bounce_flags & BF_COULD_BOUNCE) != 0) &&
 		    map->pagesneeded != 0 &&
 		    addr_needs_bounce(dmat, curaddr)) {
-			sgsize = roundup2(sgsize, dmat->common.alignment);
+			// sgsize = roundup2(sgsize, dmat->common.alignment);
 			curaddr = add_bounce_page(dmat, map, kvaddr, curaddr,
 			    sgsize);
 		} else if ((dmat->bounce_flags & BF_COHERENT) == 0) {

@@ -570,8 +570,8 @@ _bus_dmamap_count_pages(bus_dma_tag_t dmat, bus_dmamap_t map, pmap_t pmap,
 			else
 				paddr = pmap_extract(pmap, vaddr);
 			if (must_bounce(dmat, paddr)) {
-				sg_len = roundup2(sg_len,
-				    dmat->common.alignment);
+//				sg_len = roundup2(sg_len,
+//				    dmat->common.alignment);
 				map->pagesneeded++;
 			}
 			vaddr += sg_len;
@@ -606,11 +606,11 @@ _bus_dmamap_count_ma(bus_dma_tag_t dmat, bus_dmamap_t map, struct vm_page **ma,
 			sg_len = PAGE_SIZE - ma_offs;
 			sg_len = MIN(sg_len, buflen);
 			if (must_bounce(dmat, paddr)) {
-				sg_len = roundup2(sg_len,
-				    dmat->common.alignment);
-				KASSERT(vm_addr_align_ok(sg_len,
-				    dmat->common.alignment),
-				    ("Segment size is not aligned"));
+//				sg_len = roundup2(sg_len,
+//				    dmat->common.alignment);
+//				KASSERT(vm_addr_align_ok(sg_len,
+//				    dmat->common.alignment),
+//				    ("Segment size is not aligned"));
 				map->pagesneeded++;
 			}
 			if (((ma_offs + sg_len) & ~PAGE_MASK) != 0)
@@ -725,7 +725,7 @@ bounce_bus_dmamap_load_buffer(bus_dma_tag_t dmat, bus_dmamap_t map, void *buf,
 		if ((dmat->bounce_flags & BUS_DMA_COULD_BOUNCE) != 0 &&
 		    map->pagesneeded != 0 &&
 		    must_bounce(dmat, curaddr)) {
-			sgsize = roundup2(sgsize, dmat->common.alignment);
+//			sgsize = roundup2(sgsize, dmat->common.alignment);
 			curaddr = add_bounce_page(dmat, map, kvaddr, curaddr, 0,
 			    sgsize);
 		}
@@ -787,10 +787,10 @@ bounce_bus_dmamap_load_ma(bus_dma_tag_t dmat, bus_dmamap_t map,
 		if ((dmat->bounce_flags & BUS_DMA_COULD_BOUNCE) != 0 &&
 		    map->pagesneeded != 0 &&
 		    must_bounce(dmat, paddr)) {
-			sgsize = roundup2(sgsize, dmat->common.alignment);
-			KASSERT(vm_addr_align_ok(sgsize,
-			    dmat->common.alignment),
-			    ("Segment size is not aligned"));
+//			sgsize = roundup2(sgsize, dmat->common.alignment);
+//			KASSERT(vm_addr_align_ok(sgsize,
+//			    dmat->common.alignment),
+//			    ("Segment size is not aligned"));
 			/*
 			 * Check if two pages of the user provided buffer
 			 * are used.
