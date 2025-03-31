@@ -354,23 +354,23 @@ iocap_keymngr_attach(device_t dev)
 	// whireh returns a U64, is read-only, and multiprocess-safe(?)
 	// which calls iocap_keymngr_dbg_perfcounters_sysctl(sc, 0x1000)
 	// which returns a U64 (or a 'QU').
-	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "good_read",
+	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "good_write",
 	    CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0x1000,
 	    iocap_keymngr_dbg_perfcounters_sysctl, "QU",
-	    "Number of correct IOCap reads handled by the key manager");
+	    "Number of correct IOCap writes handled by the key manager");
 	// Ditto for the rest
-	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "bad_read",
+	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "bad_write",
 	    CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0x1008,
 	    iocap_keymngr_dbg_perfcounters_sysctl, "QU",
-	    "Number of incorrect IOCap reads handled by the key manager");
-	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "good_write",
+	    "Number of incorrect IOCap writes handled by the key manager");
+	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "good_read",
 	    CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0x1010,
 	    iocap_keymngr_dbg_perfcounters_sysctl, "QU",
-	    "Number of correct IOCap writes handled by the key manager");
-	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "bad_write",
+	    "Number of correct IOCap reads handled by the key manager");
+	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "bad_read",
 	    CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0x1018,
 	    iocap_keymngr_dbg_perfcounters_sysctl, "QU",
-	    "Number of incorrect IOCap writes handled by the key manager");
+	    "Number of incorrect IOCap reads handled by the key manager");
 
 	iocap_keymngr_dbg_perfcounters(dev);
 
