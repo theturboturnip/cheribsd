@@ -1151,7 +1151,7 @@ vtblk_iocap_request_execute_cb(void * callback_arg, bus_dma_segment_t * segs,
 		for (i = 0; i < nseg; i++) {
 			error = sglist_append_phys(sg,
 			    (vm_paddr_t)segs[i].ds_addr, segs[i].ds_len);
-			device_printf(sc->vtblk_iocap_dev, "sglist_append_phys 0x%lx 0x%lx\n", segs[i].ds_addr, segs[i].ds_len);
+			// device_printf(sc->vtblk_iocap_dev, "sglist_append_phys 0x%lx 0x%lx\n", segs[i].ds_addr, segs[i].ds_len);
 			if (error || sg->sg_nseg == sg->sg_maxseg) {
 				panic("%s: bio %p data buffer too big %d",
 				    __func__, bp, error);

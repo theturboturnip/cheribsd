@@ -486,7 +486,7 @@ static int iocap_keymngr_alloc_key_ids(device_t dev, uint8_t *key_ids,
 
 		key_ids[i] = sc->last_allocated_key;
 
-		device_printf(dev, "allocated key %d for #%d of a tag\n", sc->last_allocated_key, i);
+		// device_printf(dev, "allocated key %d for #%d of a tag\n", sc->last_allocated_key, i);
 	}
 
 	// TODO unlock key manager
@@ -650,7 +650,7 @@ iocap_enabled_tag_assign_key(bus_dma_iocap_enabled_tag_t tag,
 	}
 	if (tag->key_refcounts[nth_key_of_tag] == 1) {
 		uint8_t key_id = tag->allocated_keys[nth_key_of_tag];
-		device_printf(tag->iocap_keymngr, "Activating IOCap key %d\n", key_id);
+		// device_printf(tag->iocap_keymngr, "Activating IOCap key %d\n", key_id);
 		iocap_keymngr_init_key(tag->iocap_keymngr, key_id);
 	}
 
@@ -675,7 +675,8 @@ iocap_enabled_tag_unassign_key(bus_dma_iocap_enabled_tag_t tag,
 	tag->key_refcounts[nth_key_of_tag]--;
 	if (tag->key_refcounts[nth_key_of_tag] == 0) {
 		uint8_t key_id = tag->allocated_keys[nth_key_of_tag];
-		device_printf(tag->iocap_keymngr,
+		if (tag->key_max_refcounts[nth_key_of_tag] > 1)
+			device_printf(tag->iocap_keymngr,
 				"Deactivating IOCap key %d with max refcount %zu\n",
 				key_id, tag->key_max_refcounts[nth_key_of_tag]);
 		iocap_keymngr_clear_key(tag->iocap_keymngr, key_id);
@@ -1158,7 +1159,7 @@ iocap_enabled_load_buffer(bus_dma_tag_t dmat, bus_dmamap_t map,
 	));
 	iocap_map->state = iocap_dmamap_loading;
 
-	device_printf(iocap_dmat->iocap_keymngr, "iocap_enabled_load_buffer buf %p buflen 0x%lx\n", buf, buflen);
+	// device_printf(iocap_dmat->iocap_keymngr, "iocap_enabled_load_buffer buf %p buflen 0x%lx\n", buf, buflen);
 
 	// TODO the default riscv bounce buffer implementation may pad the dmasegments out to 4KiB multiples.
 	// This is only in the case where addr_needs_bounce(dmat, curaddr): see busdma_bounce.c:673
