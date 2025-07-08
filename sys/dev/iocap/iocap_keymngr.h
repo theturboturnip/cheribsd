@@ -108,8 +108,11 @@ bus_iocap_dmamap_t bus_dmamap_can_mint_iocap(bus_dmamap_t map);
 // and the permissions for that physical segment and generates an IOCap
 // using the secret key assigned to the dmamap.
 //
+// TODO HOLDOVER: If the map doesn't have a key assigned, assigns the key for you. DO NOT CALL FROM MULTIPLE THREADS AT ONCE.
+// THIS ALSO TAKES A LOCK SO IS BLOCKING
+//
 // Returns 0 if successful,
-// EPERM if the map is not usable for minting,
+// EPERM if the map is not usable for minting OR if bus_dmamap_sync has not yet been called and iocap_enabled_tag_assign_key fails,
 // and EDOM if ccap2024_11_init_cavs_exact fails.
 int bus_dmamap_mint_iocap(bus_iocap_dmamap_t map, bus_dma_segment_t* segment, CCapPerms perms, struct iocap* out)  __attribute__((warn_unused_result));
 
@@ -119,9 +122,20 @@ int bus_dmamap_mint_iocap(bus_iocap_dmamap_t map, bus_dma_segment_t* segment, CC
 // This uses ccap2024_11_init_virtio_cavs_exact and thus combines some flags and the next field into the secret_key_id
 // storage on the IOCap.
 //
+// TODO HOLDOVER: If the map doesn't have a key assigned, assigns the key for you. DO NOT CALL FROM MULTIPLE THREADS AT ONCE.
+// THIS ALSO TAKES A LOCK SO IS BLOCKING
+//
 // Returns 0 if successful,
-// EPERM if the map is not usable for minting,
+// EPERM if the map is not usable for minting OR if bus_dmamap_sync has not yet been called and iocap_enabled_tag_assign_key fails,
 // and EDOM if ccap2024_11_init_virtio_cavs_exact fails or if the segment length >4GiB
 int bus_dmamap_mint_virtio_iocap(bus_iocap_dmamap_t map, bus_dma_segment_t* segment, uint16_t flags, uint16_t next, struct iocap* out)  __attribute__((warn_unused_result));
+
+// The callback for bus_dmamap_unload2, taking two caller-defined arguments
+typedef void (*iocap_keymngr_bus_dmamap_unload2_cb)(void* arg1, void* arg2);
+
+// Equivalent of bus_dmamap_unload that calls a callback once the relevant memory is inaccessible.
+// That memory should not be used for any other purpose, unless that purpose is access by the same device,
+// until the callback is called.
+int iocap_keymngr_bus_dmamap_unload2(bus_dma_iocap_enabled_tag_t tag, bus_iocap_dmamap_t map, iocap_keymngr_bus_dmamap_unload2_cb on_unmapped, void* arg1, void* arg2);
 
 #endif
