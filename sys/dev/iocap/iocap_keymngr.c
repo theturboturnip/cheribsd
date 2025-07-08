@@ -3,11 +3,14 @@
 #include <sys/types.h>
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/bitset.h>
+#include <sys/_bitset.h>
 #include <sys/bus.h>
 #include <sys/kernel.h>
 #include <sys/module.h>
 #include <sys/rman.h>
 #include <sys/memdesc.h>
+#include <sys/mutex.h>
 
 #include <machine/bus.h>
 #include <machine/bus_dma.h>
@@ -48,14 +51,23 @@ struct bus_dma_iocap_refinable_tag {
 	// int has_non_iocap_mappings;
 };
 
+// Previously, I kept a permanent 256-entry array of key states inside the key manager,
+// which required taking a lock on the key manager whenever you use the keys.
+struct iocap_key_state {
+	CCapU128 key_data __aligned(8);
+	uint8_t key_id;
+	// Does the key currently have usable contents i.e. can it be used to mint iocaps
+	bool active;
+};
+
 struct bus_dma_iocap_enabled_tag {
 	struct bus_dma_tag_common common;
 	bus_dma_tag_t base_tag;
 	device_t iocap_keymngr;
 	enum iocap_keymngr_revocation_mode revocation_mode;
 	uint8_t n_keys;
-	uint8_t allocated_keys[MAX_NUM_KEYS_PER_TAG];
-	// TODO how big does this have to be :sweat_smile:
+	struct iocap_key_state allocated_keys[MAX_NUM_KEYS_PER_TAG];
+	// TODO how big to refcounts get :sweat_smile:
 	// virtio preallocates more than 255 dmamaps per tag lol
 	// this particular case will not be for much longer, once we move to refcounting-keys-on-load rather than refcounting-keys-on-create-map
 	// but it's still something to think about
@@ -159,15 +171,7 @@ static int iocap_keymngr_detach(device_t);
 
 static bus_get_dma_tag_t iocap_keymngr_get_dma_tag;
 
-struct iocap_key_state {
-	// TODO a lock
-	CCapU128 key_data __aligned(8);
-	// Is this key currently assigned to a tag
-	bool allocated;
-	// Does the key currently have usable contents i.e. can it be used to mint iocaps
-	bool active;
-	// TODO maybe a linked-list of the tags using this key? idk
-};
+BITSET_DEFINE(iocap_keymngr_avail_keys, 256);
 
 struct iocap_keymngr_softc {
 	struct simplebus_softc base;
@@ -182,14 +186,13 @@ struct iocap_keymngr_softc {
 	int sc_rrid;
 	int sc_rtype; /* SYS_RES_{IOPORT|MEMORY}. */
 
-	// bus_dma_tag_t	sc_dmat;
-	// struct mtx		 iocap_keymngr_mtx;
+	struct mtx iocap_keymngr_mtx;
 
 	struct bus_dma_iocap_refinable_tag base_refinable_tag;
 
-	uint32_t available_keys;
-	uint8_t last_allocated_key;
-	struct iocap_key_state keys[256];
+	// Bitmask for allocated keys, 256-bits for now, but expandable if needed.
+	// Bit #N is 1 if key N is free, 0 otherwise.
+	struct iocap_keymngr_avail_keys available_keys;
 };
 
 static device_method_t iocap_keymngr_methods[] = {
@@ -221,12 +224,13 @@ static void iocap_keymngr_dbg_perfcounters(device_t);
 static int iocap_keymngr_dbg_perfcounters_sysctl(SYSCTL_HANDLER_ARGS);
 
 // Assign n_key_ids key IDs to a tag, without reusing key IDs already assigned to other tags
-static int iocap_keymngr_alloc_key_ids(device_t, uint8_t *key_ids,
-		uint8_t n_key_ids);
+static int iocap_keymngr_alloc_key_ids(device_t, struct iocap_key_state *key_states,
+		uint8_t n_key_states);
 // Fill the key data for this id with random data so it can be used to mint iocaps.
 // Takes the lock for the key.
-static void iocap_keymngr_init_key(device_t, uint8_t key_id);
+static void iocap_keymngr_init_key(device_t, struct iocap_key_state *key_state);
 
+/*
 // Retrieve the key data for this id so we can use it to mint an IOCap,
 // and takes the lock on the key so it doesn't change while minting.
 // Return NULL if not inited, and still takes the lock in this case.
@@ -234,14 +238,15 @@ static void iocap_keymngr_init_key(device_t, uint8_t key_id);
 static CCapU128 *iocap_keymngr_get_and_lock_key(device_t, uint8_t key_id);
 
 static void iocap_keymngr_unlock_key(device_t, uint8_t key_id);
+*/
 
 // Clear out the key data for this ID.
 // Takes the lock for the key while clearing.
-static void iocap_keymngr_clear_key(device_t, uint8_t key_id);
+static void iocap_keymngr_clear_key(device_t, struct iocap_key_state *key_state);
 
 // Clear data for all given key IDs and mark them as not-allocated so other tags can reuse them.
-static void iocap_keymngr_free_key_ids(device_t, uint8_t const *key_ids,
-		uint8_t n_key_ids);
+static void iocap_keymngr_free_key_ids(device_t, struct iocap_key_state const *key_states,
+		uint8_t n_key_states);
 
 
 // Assign a key within a tag for a map.
@@ -334,11 +339,8 @@ iocap_keymngr_attach(device_t dev)
 		goto fail;
 	}
 
-	sc->available_keys = 256;
-	// The key allocator is very simple: if available_keys >= 1, increment
-	// last_allocated_key until !sc->keys[last_allocated_key].allocated.
-	// Set last_allocated_key = 0xFF so that +1 => 0
-	sc->last_allocated_key = 0xFF;
+	/* Initialize available_keys to filled (all bits set) */
+	sc->available_keys = (struct iocap_keymngr_avail_keys) BITSET_T_INITIALIZER(BITSET_FSET(__bitset_words(256)));
 
 	// Add the sysctls
 	struct sysctl_ctx_list *ctx;
@@ -374,7 +376,10 @@ iocap_keymngr_attach(device_t dev)
 
 	iocap_keymngr_dbg_perfcounters(dev);
 
-	// TODO setup lock
+	// Setup lock
+	// TODO: Using MTX_DEF right now because I assume there are no points where an iocap_keymngr locked function needs to be reentrant. Is that... sensible?
+	// It's what virtio_blk does, but that might not be built to handle multithreading
+	mtx_init(&sc->iocap_keymngr_mtx, "IOCap Key Manager Lock", NULL, MTX_DEF);
 
 fail:
 	if (error) {
@@ -396,23 +401,25 @@ iocap_keymngr_detach(device_t dev)
 
 	sc = device_get_softc(dev);
 
-	// TODO
-	// 	VTBLK_LOCK(sc);
+	{
+		// Lock key manager
+		mtx_lock(&sc->iocap_keymngr_mtx);
 
-	if (sc->base_refinable_tag.base_tag != NULL) {
-		bus_dma_tag_destroy(sc->base_refinable_tag.base_tag);
-		sc->base_refinable_tag.base_tag = NULL;
+		if (sc->base_refinable_tag.base_tag != NULL) {
+			bus_dma_tag_destroy(sc->base_refinable_tag.base_tag);
+			sc->base_refinable_tag.base_tag = NULL;
+		}
+
+		if (sc->sc_rres != NULL) {
+			bus_release_resource(dev, sc->sc_rtype, sc->sc_rrid, sc->sc_rres);
+			sc->sc_rres = NULL;
+		}
+
+		// Unlock key manager
+		mtx_unlock(&sc->iocap_keymngr_mtx);
 	}
 
-	if (sc->sc_rres != NULL) {
-		bus_release_resource(dev, sc->sc_rtype, sc->sc_rrid, sc->sc_rres);
-		sc->sc_rres = NULL;
-	}
-
-	// TODO
-	//	VTBLK_UNLOCK(sc);
-
-	// TODO destroy lock
+	mtx_destroy(&sc->iocap_keymngr_mtx);
 
 	return err;
 }
@@ -453,84 +460,90 @@ iocap_keymngr_dbg_perfcounters_sysctl(SYSCTL_HANDLER_ARGS)
 }
 
 // Assign n_key_ids key IDs to a tag, without reusing key IDs already assigned to other tags
-static int iocap_keymngr_alloc_key_ids(device_t dev, uint8_t *key_ids,
-		uint8_t n_key_ids)
+static int iocap_keymngr_alloc_key_ids(device_t dev, struct iocap_key_state *key_states,
+		uint8_t n_key_states)
 {
 	struct iocap_keymngr_softc *sc;
 
 	sc = device_get_softc(dev);
 
-	// TODO take lock on key manager
+	// Lock key manager
+	mtx_lock(&sc->iocap_keymngr_mtx);
 
-	if (sc->available_keys < n_key_ids) {
+	if (BIT_COUNT(256, &sc->available_keys) < n_key_states) {
+		// Unlock key manager
+		mtx_unlock(&sc->iocap_keymngr_mtx);
+
 		return ENOSPC;
 	}
 
-	for (int i = 0; i < n_key_ids; i++) {
-		// Search through keys until we find one that isn't allocated
-		do {
-			// will wrap around at 256
-			sc->last_allocated_key++;
-		}
-		while (sc->keys[sc->last_allocated_key].allocated); // TODO lock key?
-		// Allocate the key
+	// Search for the right number of keys in the bitmask, then save which ones we want to take.
+	// Don't count them as taken yet, because we might not find them all.
+	for (uint8_t i = 0; i < n_key_states; i++) {
+		// TODO go back to rolling my own bitset, this one doesn't even use _clz
+		uint16_t key_plus_one = BIT_FFS(256, &sc->available_keys);
 
-		// TODO take lock on key
+		KASSERT(key_plus_one > 0, ("iocap_keymngr_alloc_key_ids had BIT_COUNT space but didn't find a set bit\n"));
 
-		sc->keys[sc->last_allocated_key].allocated = true;
-		KASSERT(!sc->keys[sc->last_allocated_key].active,
-			("Key #%d is freshly allocated but already active.\n",
-				sc->last_allocated_key));
-
-		// TODO release lock on key
-
-		key_ids[i] = sc->last_allocated_key;
-
-		// device_printf(dev, "allocated key %d for #%d of a tag\n", sc->last_allocated_key, i);
+		key_states[i].key_id = key_plus_one - 1;
 	}
 
-	// TODO unlock key manager
+	device_printf(dev, "Allocated the following %d IOCap key ids\n", n_key_states);
+
+	// Now we know we have them all, we can mark them as taken
+	for (uint8_t i = 0; i < n_key_states; i++) {
+		uint8_t key_id = key_states[i].key_id;
+		BIT_CLR(256, key_id, &sc->available_keys);
+		device_printf(dev, "key #%d\n", key_id);
+	}
+
+	// Unlock key manager
+	mtx_unlock(&sc->iocap_keymngr_mtx);
 
 	return 0;
 }
 
 // Fill the key data for this id with random data so it can be used to mint iocaps.
 // Takes the lock for the key.
-static void iocap_keymngr_init_key(device_t dev, uint8_t key_id)
+static void iocap_keymngr_init_key(device_t dev, struct iocap_key_state* key_state)
 {
 	struct iocap_keymngr_softc *sc;
 
 	sc = device_get_softc(dev);
 
-	// TODO take lock on key
+	// TODO do we need to take/release the lock on the key manager here?
+	// From a strict perspective, probably, but all we're trying to do here is use the bus_space.
+	// That bus_space is constant unless we're in the middle of tearing down the whole thing anyway.
 
-	KASSERT(sc->keys[key_id].allocated,
-		("Key %d must be allocated in order to become active", key_id));
-	KASSERT(!sc->keys[key_id].active,
-		("Key %d must not already be active", key_id));
+	// TODO take lock on key?
+
+	KASSERT(!key_state->active,
+		("Key %d must not already be active", key_state->key_id));
 
 	// Take random data
-	arc4random_buf(sc->keys[key_id].key_data, 16);
-	sc->keys[key_id].active = true;
+	arc4random_buf(key_state->key_data, 16);
+	key_state->active = true;
 	// Write the key data into the MMIO device
 	// key_data is aligned to 8-bytes so we can cast the pointer to uint64
 	// bus_space_write_multi etc. are not implemented for this specific bus_space... bleh
 	for (int i = 0; i < 2; i++) {
-		uint64_t* key_as_64bits = (uint64_t*)sc->keys[key_id].key_data;
+		uint64_t* key_as_64bits = (uint64_t*)key_state->key_data;
 		uint64_t key_i = key_as_64bits[i];
 		bus_space_write_8(sc->bst, sc->bsh,
-			0x1000 + (key_id << 4) + (i << 3),
+			0x1000 + (key_state->key_id << 4) + (i << 3),
 			key_i);
 	}
 
 	// TODO memory barrier needed?
 	mb();
 	// Set the key status in the MMIO device as 1
-	bus_space_write_8(sc->bst, sc->bsh, 0x0 + (key_id << 4), 1);
+	bus_space_write_8(sc->bst, sc->bsh, 0x0 + (key_state->key_id << 4), 1);
 
-	// TODO release lock on key
+	// TODO release lock on key?
 }
 
+/*
+ *
 // Retrieve the key data for this id so we can use it to mint an IOCap,
 // and takes the lock on the key so it doesn't change while minting.
 // Return NULL if not inited, and still takes the lock in this case.
@@ -541,7 +554,7 @@ static CCapU128 *iocap_keymngr_get_and_lock_key(device_t dev, uint8_t key_id)
 
 	sc = device_get_softc(dev);
 
-	// TODO take lock on key
+	// TODO take lock on key?
 
 	if (!sc->keys[key_id].active) {
 		return NULL;
@@ -550,76 +563,70 @@ static CCapU128 *iocap_keymngr_get_and_lock_key(device_t dev, uint8_t key_id)
 	return &sc->keys[key_id].key_data;
 }
 
-static void iocap_keymngr_unlock_key(device_t dev, uint8_t key_id)
+static void iocap_keymngr_unlock_key(device_t dev, struct iocap_key_state* key_data)
 {
 	// struct iocap_keymngr_softc *sc;
 	//
 	// sc = device_get_softc(dev);
 
-	// TODO release lock on key
+	// TODO release lock on key?
 }
+*/
 
 // Clear out the key data for this ID.
 // Takes the lock for the key while clearing.
-static void iocap_keymngr_clear_key(device_t dev, uint8_t key_id)
+static void iocap_keymngr_clear_key(device_t dev, struct iocap_key_state* key_state)
 {
 	struct iocap_keymngr_softc *sc;
 
 	sc = device_get_softc(dev);
 
-	// TODO take lock on key
+	// TODO take lock on key?
 
-	KASSERT(sc->keys[key_id].allocated,
-		("Key %d must be allocated in order to clear", key_id));
-	KASSERT(sc->keys[key_id].active,
-		("Key %d must be active to clear it", key_id));
+	KASSERT(key_state->active,
+		("Key %d must be active to clear it", key_state->key_id));
+
+	uint8_t key_id = key_state->key_id;
 
 	// Tell device to start revoking as early as possible
 	bus_space_write_8(sc->bst, sc->bsh, 0x0 + (key_id << 4), 0);
 	// Clear data out
-	memset(sc->keys[key_id].key_data, 0, 16);
-	sc->keys[key_id].active = false;
+	memset(key_state->key_data, 0, 16);
+	key_state->active = false;
 	// Check the MMIO device has actually revoked
 	while (bus_space_read_8(sc->bst, sc->bsh, 0x0 + (key_id << 4)) != 0) {
 		// wait until the MMIO device confirms revocation with
 		// key status == 0
 	}
 
-	// TODO release lock on key
+	// TODO release lock on key?
 }
 
 // Clear data for all given key IDs and mark them as not-allocated so other tags can reuse them.
-static void iocap_keymngr_free_key_ids(device_t dev, uint8_t const *key_ids,
-		uint8_t n_key_ids)
+static void iocap_keymngr_free_key_ids(device_t dev, struct iocap_key_state const *key_states,
+		uint8_t n_key_states)
 {
 	struct iocap_keymngr_softc *sc;
 
 	sc = device_get_softc(dev);
 
-	// TODO take lock on key manager
+	// Lock key manager
+	mtx_lock(&sc->iocap_keymngr_mtx);
 
-	KASSERT(n_key_ids + sc->available_keys <= 256,
-		("Inconsistency: somehow we are freeing %d key IDs but already have %d available.",
-			n_key_ids, sc->available_keys));
+	KASSERT(n_key_states + BIT_COUNT(256, &sc->available_keys) <= 256,
+		("Inconsistency: somehow we are freeing %d key IDs but already have %ld available.",
+			n_key_states, BIT_COUNT(256, &sc->available_keys)));
 
-	for (int i = 0; i < n_key_ids; i++) {
+	for (int i = 0; i < n_key_states; i++) {
 		uint8_t key_id;
 
-		key_id = key_ids[i];
+		key_id = key_states[i].key_id;
 
-		// TODO take lock on key
-
-		KASSERT(!sc->keys[key_id].active,
-			("Trying to free key ID #%d when it's still active\n",
-				key_id));
-		sc->keys[key_id].allocated = false;
-
-		// TODO release lock on key
-
-		sc->available_keys++;
+		BIT_SET(256, key_id, &sc->available_keys);
 	}
 
-	// TODO unlock key manager
+	// Unlock key manager
+	mtx_unlock(&sc->iocap_keymngr_mtx);
 }
 
 
@@ -629,9 +636,7 @@ static int
 iocap_enabled_tag_assign_key(bus_dma_iocap_enabled_tag_t tag,
 		bus_iocap_dmamap_t map)
 {
-	// TODO take a lock on the map
-
-	// TODO take a lock on the tag
+	// TODO make this atomic/lockfree safe without blocking
 
 	// TODO depending on revocation strategy we should change this
 	uint8_t nth_key_of_tag = 0;
@@ -649,13 +654,11 @@ iocap_enabled_tag_assign_key(bus_dma_iocap_enabled_tag_t tag,
 		tag->key_max_refcounts[nth_key_of_tag]++;
 	}
 	if (tag->key_refcounts[nth_key_of_tag] == 1) {
-		uint8_t key_id = tag->allocated_keys[nth_key_of_tag];
-		// device_printf(tag->iocap_keymngr, "Activating IOCap key %d\n", key_id);
-		iocap_keymngr_init_key(tag->iocap_keymngr, key_id);
+		struct iocap_key_state* key_state = &tag->allocated_keys[nth_key_of_tag];
+		// device_printf(tag->iocap_keymngr, "Activating IOCap key %d\n", key_state->key_id);
+		iocap_keymngr_init_key(tag->iocap_keymngr, key_state);
 	}
 
-	// TODO release lock on tag
-	// TODO release lock on map
 	return 0;
 }
 
@@ -665,8 +668,7 @@ static int
 iocap_enabled_tag_unassign_key(bus_dma_iocap_enabled_tag_t tag,
 		bus_iocap_dmamap_t map)
 {
-	// TODO take a lock on the map
-	// TODO take a lock on the tag
+	// TODO make this atomic/lockfree safe, allowed to block
 
 	KASSERT(map->state == iocap_dmamap_loaded,
 			("Tried to unload a DMA map when it was not loaded"));
@@ -674,12 +676,12 @@ iocap_enabled_tag_unassign_key(bus_dma_iocap_enabled_tag_t tag,
 	uint8_t nth_key_of_tag = map->nth_key_of_tag;
 	tag->key_refcounts[nth_key_of_tag]--;
 	if (tag->key_refcounts[nth_key_of_tag] == 0) {
-		uint8_t key_id = tag->allocated_keys[nth_key_of_tag];
+		struct iocap_key_state* key_state = &tag->allocated_keys[nth_key_of_tag];
 		if (tag->key_max_refcounts[nth_key_of_tag] > 1)
 			device_printf(tag->iocap_keymngr,
 				"Deactivating IOCap key %d with max refcount %zu\n",
-				key_id, tag->key_max_refcounts[nth_key_of_tag]);
-		iocap_keymngr_clear_key(tag->iocap_keymngr, key_id);
+				key_state->key_id, tag->key_max_refcounts[nth_key_of_tag]);
+		iocap_keymngr_clear_key(tag->iocap_keymngr, key_state);
 
 		tag->key_max_refcounts[nth_key_of_tag] = 0;
 	}
@@ -687,8 +689,6 @@ iocap_enabled_tag_unassign_key(bus_dma_iocap_enabled_tag_t tag,
 	map->nth_key_of_tag = 0xFF;
 	map->state = iocap_dmamap_unloaded;
 
-	// TODO release lock on tag
-	// TODO release lock on map
 	return 0;
 }
 
@@ -1386,8 +1386,10 @@ bus_dmamap_mint_iocap(bus_iocap_dmamap_t map, bus_dma_segment_t *segment,
 	CCapU128 *key;
 	CCapResult res;
 
-	key_id = map->tag->allocated_keys[map->nth_key_of_tag];
-	key = iocap_keymngr_get_and_lock_key(map->tag->iocap_keymngr, key_id);
+	// TODO Do we need to take a lock on the key?
+
+	key_id = map->tag->allocated_keys[map->nth_key_of_tag].key_id;
+	key = &map->tag->allocated_keys[map->nth_key_of_tag].key_data;
 	res = CCapResult_CatastrophicFailure;
 
 	if (key != NULL) {
@@ -1399,8 +1401,6 @@ bus_dmamap_mint_iocap(bus_iocap_dmamap_t map, bus_dma_segment_t *segment,
 			key_id,
 			perms);
 	}
-
-	iocap_keymngr_unlock_key(map->tag->iocap_keymngr, key_id);
 
 	if (res != CCapResult_Success) {
 		device_printf(map->tag->iocap_keymngr,
@@ -1440,11 +1440,14 @@ bus_dmamap_mint_virtio_iocap(bus_iocap_dmamap_t map, bus_dma_segment_t *segment,
 
 	uint8_t key_id;
 	CCapU128 *key;
-	CCapResult res = CCapResult_CatastrophicFailure;
+	CCapResult res;
 	CCapNativeVirtqDesc desc;
 
-	key_id = map->tag->allocated_keys[map->nth_key_of_tag];
-	key = iocap_keymngr_get_and_lock_key(map->tag->iocap_keymngr, key_id);
+	// TODO Do we need to take a lock on the key?
+
+	key_id = map->tag->allocated_keys[map->nth_key_of_tag].key_id;
+	key = &map->tag->allocated_keys[map->nth_key_of_tag].key_data;
+	res = CCapResult_CatastrophicFailure;
 
 	if (key != NULL) {
 		desc = (CCapNativeVirtqDesc) {
@@ -1476,8 +1479,6 @@ bus_dmamap_mint_virtio_iocap(bus_iocap_dmamap_t map, bus_dma_segment_t *segment,
 		// 	(*key)[0]
 		// );
 	}
-
-	iocap_keymngr_unlock_key(map->tag->iocap_keymngr, key_id);
 
 	if (res != CCapResult_Success) {
 		device_printf(map->tag->iocap_keymngr,
