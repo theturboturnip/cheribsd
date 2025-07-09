@@ -85,12 +85,12 @@ enum iocap_keymngr_revocation_mode {
 	// mapping is bus_dmamap_sync()-d or the first IOCap is minted.
 	// Requires n_keys = 1
 	iocap_revoke_when_no_mappings_unsafe,
-	// // Pool of four keys, used with epochs.
-	// // Not guaranteed to be round-robin - consider the case where
-	// // the entire queue is backed up, and finally one epoch opens - no reason
-	// // not to use it!
-	// // TODO how to handle timeouts
-	// iocap_rolling_epoch_x4,
+	// Pool of four keys, used with epochs.
+	// Not guaranteed to be round-robin - consider the case where
+	// the entire queue is backed up, and finally one epoch opens - no reason
+	// not to use it!
+	// TODO how to handle timeouts
+	iocap_rolling_epoch_x4,
 };
 
 struct iocap_keymngr_revocation_params {
@@ -104,13 +104,13 @@ struct iocap_keymngr_revocation_params {
 			// If 0, not used. max_bytes_mapped_per_epoch must
 			// be used instead.
 			uint64_t max_num_mappings_per_epoch;
-			// The maximum number of bytes used in an epoch before
-			// rolling over to the next one.
-			// Sets the maximum number of concurrent bytes mapped as
-			// (num epochs * max_bytes_mapped_per_epoch)
-			// If 0, not used. max_num_mappings_per_epoch must
-			// be used instead.
-			uint64_t max_bytes_mapped_per_epoch;
+			// // The maximum number of bytes used in an epoch before
+			// // rolling over to the next one.
+			// // Sets the maximum number of concurrent bytes mapped as
+			// // (num epochs * max_bytes_mapped_per_epoch)
+			// // If 0, not used. max_num_mappings_per_epoch must
+			// // be used instead.
+			// uint64_t max_bytes_mapped_per_epoch;
 			// TODO max lifetime
 		} rolling_epoch;
 	} params;

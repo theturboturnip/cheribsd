@@ -444,8 +444,13 @@ vtblk_iocap_attach(device_t dev)
 	error = bus_dma_tag_refine_to_iocap_group(
 		refinable_tag,
 		(struct iocap_keymngr_revocation_params) {
-			// TODO change this!
-			.mode = iocap_revoke_when_no_mappings_unsafe,
+			.mode = iocap_rolling_epoch_x4,
+			.params = {
+				.rolling_epoch = {
+					// TODO change this!
+					.max_num_mappings_per_epoch = 1,
+				}
+			}
 		},
 		&sc->vtblk_iocap_request_tag
 	);

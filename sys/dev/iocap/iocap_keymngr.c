@@ -101,16 +101,16 @@ struct iocap_key_suballocator {
 				uint64_t active_mappings;
 				// Monotonic decreases, unmapping does not increase
 				uint64_t num_mappings_left;
-				// Monotonic decreases, unmapping does not increase
-				uint64_t bytes_mapped_left;
+				// // Monotonic decreases, unmapping does not increase
+				// uint64_t bytes_mapped_left;
 			} key_stats[MAX_NUM_KEYS_PER_TAG];
 
-			// When 0, no epochs are active (the mapping is empty).
-			// When 1-4, the epoch to insert new things into is 0-3.
-			//	In that case, the key_stats[insertion_key_plus_one] may be full, and is_full = true.
+			// The insertion_key may indicate an entry in key_data where key_data is inactive.
+			// Even if insertion_key points to a valid epoch,
+			// the key_stats[insertion_key_plus_one] may be full, and is_full = true.
 			// When is_full = true, no insertions can take place.
 			//	The first revoked key will replace insertion_key_plus_one and set is_full = false.
-			uint8_t insertion_key_plus_one;
+			uint8_t insertion_key;
 			bool is_full;
 		} rolling_epochs_x4;
 	};
@@ -533,9 +533,12 @@ static int iocap_keymngr_alloc_key_ids(device_t dev, struct iocap_key_suballocat
 	if (BIT_COUNT(256, &sc->available_keys) < key_suballoc->n_keys) {
 		// Unlock key manager
 		mtx_unlock(&sc->iocap_keymngr_mtx);
+		device_printf(dev, "Ran out of keys\n");
 
 		return ENOSPC;
 	}
+
+	device_printf(dev, "Allocated the following %d IOCap key ids\n", key_suballoc->n_keys);
 
 	// Search for the right number of keys in the bitmask, then save which ones we want to take.
 	// Don't count them as taken yet, because we might not find them all.
@@ -545,14 +548,8 @@ static int iocap_keymngr_alloc_key_ids(device_t dev, struct iocap_key_suballocat
 
 		KASSERT(key_plus_one > 0, ("iocap_keymngr_alloc_key_ids had BIT_COUNT space but didn't find a set bit\n"));
 
-		key_suballoc->key_datas[i].key_id = key_plus_one - 1;
-	}
-
-	device_printf(dev, "Allocated the following %d IOCap key ids\n", key_suballoc->n_keys);
-
-	// Now we know we have them all, we can mark them as taken
-	for (uint8_t i = 0; i < key_suballoc->n_keys; i++) {
-		uint8_t key_id = key_suballoc->key_datas[i].key_id;
+		uint8_t key_id = key_plus_one - 1;
+		key_suballoc->key_datas[i].key_id = key_id;
 		BIT_CLR(256, key_id, &sc->available_keys);
 		device_printf(dev, "key #%d\n", key_id);
 	}
@@ -689,10 +686,53 @@ iocap_enabled_tag_assign_key(bus_dma_iocap_enabled_tag_t tag,
 		key_suballoc->single_refcounted_key.total_mappings++;
 		break;
 	}
-	// case iocap_rolling_epoch_x4: {
-	// 	// TODO
-	// 	break;
-	// }
+	case iocap_rolling_epoch_x4: {
+		if (key_suballoc->rolling_epochs_x4.is_full) {
+			device_printf(tag->iocap_keymngr, "Can't allocate key, device full!\n");
+
+			// Unlock the key alloc lock
+			mtx_unlock(&key_suballoc->mtx);
+
+			return ENOSPC;
+		}
+		nth_key_of_tag = key_suballoc->rolling_epochs_x4.insertion_key;
+
+		// key_suballoc->rolling_epochs_x4.key_stats[insertion_key].bytes_mapped_left -= map->base_map->;
+		uint64_t refcount = key_suballoc->rolling_epochs_x4.key_stats[nth_key_of_tag].active_mappings + 1;
+		KASSERT(refcount != 0,
+			("%s - overflowed refcount for single refcounted key of tag %p",
+				device_get_name(tag->iocap_keymngr), tag));
+		// If we're setting the refcount to 1, the key must not have been active before - reactivate it
+		if (refcount == 1) {
+			struct iocap_key_state* key_state = &key_suballoc->key_datas[nth_key_of_tag];
+			KASSERT(key_state->active == false, ("Insertion key [%d] had no references but an active key", nth_key_of_tag));
+			// device_printf(tag->iocap_keymngr, "Activating IOCap key %d\n", key_state->key_id);
+			iocap_keymngr_init_key(tag->iocap_keymngr, key_state);
+		}
+		key_suballoc->rolling_epochs_x4.key_stats[nth_key_of_tag].active_mappings = refcount;
+
+		// Have we filled this key up? Either move on, or the whole thing is full
+		key_suballoc->rolling_epochs_x4.key_stats[nth_key_of_tag].num_mappings_left--;
+		if (key_suballoc->rolling_epochs_x4.key_stats[nth_key_of_tag].num_mappings_left == 0) {
+			uint8_t next_key = 0xFF;
+			bool found_next_key = false;
+			for (uint8_t i = 1; i < key_suballoc->n_keys; i++) {
+				next_key = (nth_key_of_tag + i) % key_suballoc->n_keys;
+				if (key_suballoc->rolling_epochs_x4.key_stats[next_key].num_mappings_left > 0) {
+					found_next_key = true;
+					break;
+				}
+			}
+			if (found_next_key) {
+				// device_printf(tag->iocap_keymngr, "Rolling key forward from %d to %d\n", nth_key_of_tag, next_key);
+				key_suballoc->rolling_epochs_x4.insertion_key = next_key;
+			} else {
+				device_printf(tag->iocap_keymngr, "Can't roll key forward from %d, device full!\n", nth_key_of_tag);
+				key_suballoc->rolling_epochs_x4.is_full = true;
+			}
+		}
+		break;
+	}
 	}
 
 	map->nth_key_of_tag = nth_key_of_tag; // TODO KASSERT nth_key_of_tag != 0xFF
@@ -779,10 +819,59 @@ iocap_enabled_tag_unassign_key(bus_dma_iocap_enabled_tag_t tag,
 		key_suballoc->single_refcounted_key.active_mappings = refcount;
 		break;
 	}
-	// case iocap_rolling_epoch_x4: {
-	// 	// TODO
-	// 	break;
-	// }
+	case iocap_rolling_epoch_x4: {
+		uint8_t key_id = map->nth_key_of_tag;
+
+		// Decrement the active refcount
+		uint64_t refcount = key_suballoc->rolling_epochs_x4.key_stats[key_id].active_mappings - 1;
+
+		// If the key is now unused, we need to
+		// - Clear the key
+		// - Flush any quarantines
+		// - Call this quarantine callback
+		// - If the tag is_full, set the insertion_key and set is_full = false
+		// - Reset the key state
+		if (refcount == 0) {
+			// if (key_suballoc->rolling_epochs_x4.key_stats[key_id].num_mappings_left =) {
+			// 	device_printf(tag->iocap_keymngr,
+			// 		"Deactivating IOCap key %d with max refcount %zu\n",
+			// 		key_suballoc->key_datas[0].key_id, key_suballoc->rolling_epochs_x4.key_stats[key_id].total_mappings);
+			// }
+
+			// Clear the key
+			struct iocap_key_state* key_state = &key_suballoc->key_datas[key_id];
+			// device_printf(tag->iocap_keymngr, "Deactivating IOCap key %d\n", key_state->key_id);
+			iocap_keymngr_clear_key(tag->iocap_keymngr, key_state);
+
+			// Flush any quarantines
+			flush_quarantines(&key_suballoc->rolling_epochs_x4.key_stats[key_id].quarantine);
+			// Call this quarantine callback
+			if (cb != NULL) {
+				cb(cb_arg1, cb_arg2);
+			}
+
+			// If the tag is_full, set the insertion_key and set is_full = false
+			if (key_suballoc->rolling_epochs_x4.is_full) {
+				key_suballoc->rolling_epochs_x4.insertion_key = key_id;
+				key_suballoc->rolling_epochs_x4.is_full = false;
+			}
+
+			// Reset the key state
+			key_suballoc->rolling_epochs_x4.key_stats[key_id].active_mappings = 0;
+			key_suballoc->rolling_epochs_x4.key_stats[key_id].num_mappings_left = key_suballoc->params.params.rolling_epoch.max_num_mappings_per_epoch;
+		} else if (cb != NULL) {
+			// Otherwise just add to the quarantine
+			struct iocap_keymngr_quarantined_mem_cb* cb_entry = malloc(
+				sizeof(struct iocap_keymngr_quarantined_mem_cb),
+				M_IOCAP_DMAMAP_QUARANTINE, M_NOWAIT);
+			cb_entry->cb = cb;
+			cb_entry->cb_arg1 = cb_arg1;
+			cb_entry->cb_arg2 = cb_arg2;
+			SLIST_INSERT_HEAD(&key_suballoc->rolling_epochs_x4.key_stats[key_id].quarantine, cb_entry, entries);
+		}
+		key_suballoc->rolling_epochs_x4.key_stats[key_id].active_mappings = refcount;
+		break;
+	}
 	}
 
 	map->nth_key_of_tag = 0xFF;
@@ -1465,13 +1554,13 @@ bus_dma_tag_refine_to_iocap_group(bus_dma_iocap_refinable_tag_t tag,
 		n_keys = 1;
 		break;
 	}
-	// case iocap_rolling_epoch_x4: {
-	// 	if (params.params.rolling_epoch.max_bytes_mapped_per_epoch == 0 && params.params.rolling_epoch.max_num_mappings_per_epoch) {
-	// 		return EINVAL;
-	// 	}
-	// 	n_keys = 4;
-	// 	break;
-	// }
+	case iocap_rolling_epoch_x4: {
+		if (/* params.params.rolling_epoch.max_bytes_mapped_per_epoch == 0 && */ params.params.rolling_epoch.max_num_mappings_per_epoch == 0) {
+			return EINVAL;
+		}
+		n_keys = 4;
+		break;
+	}
 	default:
 		return EINVAL;
 	}
@@ -1486,6 +1575,18 @@ bus_dma_tag_refine_to_iocap_group(bus_dma_iocap_refinable_tag_t tag,
 	new_tag->key_suballoc = (struct iocap_key_suballocator) {0};
 	new_tag->key_suballoc.n_keys = n_keys;
 	new_tag->key_suballoc.params = params;
+
+	switch (params.mode) {
+	case iocap_rolling_epoch_x4: {
+		for (uint8_t i = 0; i < 4; i++)
+			new_tag->key_suballoc.rolling_epochs_x4.key_stats[i].num_mappings_left =
+				params.params.rolling_epoch.max_num_mappings_per_epoch;
+		break;
+	}
+	case iocap_revoke_when_no_mappings_unsafe:
+		// No extra initing
+		break;
+	}
 
 	mtx_init(&new_tag->key_suballoc.mtx, "IOCap DMA Tag Key Allocation Mutex", NULL, MTX_DEF);
 
