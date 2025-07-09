@@ -81,14 +81,39 @@ typedef struct bus_iocap_dmamap *bus_iocap_dmamap_t;
 bus_dma_iocap_refinable_tag_t bus_dma_tag_iocap_refinable(bus_dma_tag_t tag);
 
 enum iocap_keymngr_revocation_mode {
-    // Effectively zero temporal safety until all mappings for a IOCap Group are eliminated.
-    // Requires n_keys = 1
-    iocap_revoke_when_no_mappings_unsafe,
+	// A single key, filled in with random data on demand once the first
+	// mapping is bus_dmamap_sync()-d or the first IOCap is minted.
+	// Requires n_keys = 1
+	iocap_revoke_when_no_mappings_unsafe,
+	// // Pool of four keys, used with epochs.
+	// // Not guaranteed to be round-robin - consider the case where
+	// // the entire queue is backed up, and finally one epoch opens - no reason
+	// // not to use it!
+	// // TODO how to handle timeouts
+	// iocap_rolling_epoch_x4,
 };
 
 struct iocap_keymngr_revocation_params {
-    enum iocap_keymngr_revocation_mode   mode;
-    uint8_t n_keys; // TODO uint16?
+	enum iocap_keymngr_revocation_mode   mode;
+	union {
+		struct {
+			// The maximum number of mappings used in an epoch before
+			// rolling over to the next one.
+			// Sets the maximum number of concurrent mappings as
+			// (num epochs * max_num_mappings_per_epoch)
+			// If 0, not used. max_bytes_mapped_per_epoch must
+			// be used instead.
+			uint64_t max_num_mappings_per_epoch;
+			// The maximum number of bytes used in an epoch before
+			// rolling over to the next one.
+			// Sets the maximum number of concurrent bytes mapped as
+			// (num epochs * max_bytes_mapped_per_epoch)
+			// If 0, not used. max_num_mappings_per_epoch must
+			// be used instead.
+			uint64_t max_bytes_mapped_per_epoch;
+			// TODO max lifetime
+		} rolling_epoch;
+	} params;
 };
 
 // Take a generic IOCap-able tag and refine it to a Type 2 i.e. IOCap Key Group Tag.
@@ -136,6 +161,10 @@ typedef void (*iocap_keymngr_bus_dmamap_unload2_cb)(void* arg1, void* arg2);
 // Equivalent of bus_dmamap_unload that calls a callback once the relevant memory is inaccessible.
 // That memory should not be used for any other purpose, unless that purpose is access by the same device,
 // until the callback is called.
-int iocap_keymngr_bus_dmamap_unload2(bus_dma_iocap_enabled_tag_t tag, bus_iocap_dmamap_t map, iocap_keymngr_bus_dmamap_unload2_cb on_unmapped, void* arg1, void* arg2);
+// The callback may be called immediately, and should not call any functions related to IOCaps
+// as locks may be held.
+void iocap_keymngr_bus_dmamap_unload2(bus_dma_iocap_enabled_tag_t tag,
+	bus_iocap_dmamap_t map, iocap_keymngr_bus_dmamap_unload2_cb on_unmapped,
+	void* arg1, void* arg2);
 
 #endif

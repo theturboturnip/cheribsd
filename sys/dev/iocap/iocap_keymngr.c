@@ -36,6 +36,7 @@ static_assert(offsetof(struct bus_dma_tag_common, impl) == 0,
 
 static MALLOC_DEFINE(M_IOCAP_DMATAG, "iocap_dmatag", "IOCAP DMA Tag");
 static MALLOC_DEFINE(M_IOCAP_DMAMAP, "iocap_dmamap", "IOCAP DMA Map");
+static MALLOC_DEFINE(M_IOCAP_DMAMAP_QUARANTINE, "iocap_dmamap_quarantine", "IOCAP DMA Map Quarantine Entry");
 
 #define MAX_NUM_KEYS_PER_TAG 4
 
@@ -67,22 +68,60 @@ struct iocap_key_state {
 	bool active;
 };
 
+struct iocap_keymngr_quarantined_mem_cb {
+	SLIST_ENTRY(iocap_keymngr_quarantined_mem_cb) entries;
+	iocap_keymngr_bus_dmamap_unload2_cb cb;
+	void* cb_arg1;
+	void* cb_arg2;
+};
+
+SLIST_HEAD(iocap_keymngr_quarantine_queue, iocap_keymngr_quarantined_mem_cb);
+
+struct iocap_key_suballocator {
+	struct mtx mtx;
+	struct iocap_key_state key_datas[MAX_NUM_KEYS_PER_TAG];
+	uint8_t n_keys;
+	struct iocap_keymngr_revocation_params params;
+	union {
+		struct {
+			// List of callbacks to call once the key is revoked
+			struct iocap_keymngr_quarantine_queue quarantine;
+			// Increases when a new mapping is mapped, decreased when a mapping is unmapped
+			uint64_t active_mappings;
+			// Monotonic increases, unmapping does not decrease
+			uint64_t total_mappings;
+		} single_refcounted_key;
+		struct {
+			// Per-epoch statistics
+			struct {
+				// List of callbacks to call once the epoch key is revoked
+				struct iocap_keymngr_quarantine_queue quarantine;
+				// Increases when a new mapping is mapped, decreased when a mapping is unmapped.
+				// When nonzero, the mapping is active
+				uint64_t active_mappings;
+				// Monotonic decreases, unmapping does not increase
+				uint64_t num_mappings_left;
+				// Monotonic decreases, unmapping does not increase
+				uint64_t bytes_mapped_left;
+			} key_stats[MAX_NUM_KEYS_PER_TAG];
+
+			// When 0, no epochs are active (the mapping is empty).
+			// When 1-4, the epoch to insert new things into is 0-3.
+			//	In that case, the key_stats[insertion_key_plus_one] may be full, and is_full = true.
+			// When is_full = true, no insertions can take place.
+			//	The first revoked key will replace insertion_key_plus_one and set is_full = false.
+			uint8_t insertion_key_plus_one;
+			bool is_full;
+		} rolling_epochs_x4;
+	};
+};
+
 struct bus_dma_iocap_enabled_tag {
 	struct bus_dma_tag_common common;
 	bus_dma_tag_t base_tag;
 	device_t iocap_keymngr;
-	enum iocap_keymngr_revocation_mode revocation_mode;
-	uint8_t n_keys;
-	struct iocap_key_state allocated_keys[MAX_NUM_KEYS_PER_TAG];
-	// TODO how big do refcounts get :sweat_smile:
-	// virtio preallocates more than 255 dmamaps per tag lol
-	// this particular case will not be for much longer, once we move to refcounting-keys-on-load rather than refcounting-keys-on-create-map
-	// but it's still something to think about
-	uint64_t key_refcounts[MAX_NUM_KEYS_PER_TAG];
-	uint64_t key_max_refcounts[MAX_NUM_KEYS_PER_TAG];
-	// TODO more complicated mapping tracking, epochs?
-	int32_t map_count;
-	struct mtx key_alloc_mtx;
+
+	struct iocap_key_suballocator key_suballoc;
 };
 
 //                               IOCapblt
@@ -241,34 +280,24 @@ static int iocap_keymngr_dbg_perfcounters_sysctl(SYSCTL_HANDLER_ARGS);
 // Assign n_key_ids key IDs from the key manager to a tag, without reusing key IDs already assigned to other tags.
 //
 // Takes the mutex on the key manager.
-static int iocap_keymngr_alloc_key_ids(device_t, struct iocap_key_state *key_states,
-		uint8_t n_key_states);
+static int iocap_keymngr_alloc_key_ids(device_t, struct iocap_key_suballocator *key_suballoc);
 
 // Fill the key data for this id with random data so it can be used to mint iocaps.
 //
 // Assumes the relevant key allocator mutex is held.
 static void iocap_keymngr_init_key(device_t, struct iocap_key_state *key_state);
 
-/*
-// Retrieve the key data for this id so we can use it to mint an IOCap,
-// and takes the lock on the key so it doesn't change while minting.
-// Return NULL if not inited, and still takes the lock in this case.
-// Must call iocap_keymngr_unlock_key() after using the key to release it to others.
-static CCapU128 *iocap_keymngr_get_and_lock_key(device_t, uint8_t key_id);
-
-static void iocap_keymngr_unlock_key(device_t, uint8_t key_id);
-*/
-
 // Clear out the key data for this ID.
 //
 // Assumes the relevant key allocator mutex is held.
 static void iocap_keymngr_clear_key(device_t, struct iocap_key_state *key_state);
 
-// Clear data for all given key IDs in a DMA tag and mark them as not-allocated in the device so other tags can reuse them.
+// Clear data for all given key IDs in a key suballocator and mark them as not-allocated in the device so other tags can reuse them.
+// TODO need some way to ensure this doesn't leave a key open and usable,
 //
-// Assumes the relevant key allocator mutex is held.
-static void iocap_keymngr_free_key_ids(device_t, struct iocap_key_state const *key_states,
-		uint8_t n_key_states);
+// Assumes the relevant key suballocator mutex is held.
+// Takes the key manager mutex.
+static void iocap_keymngr_free_key_ids(device_t, struct iocap_key_suballocator* key_suballoc);
 
 
 // Assign a key within a tag for a map.
@@ -284,12 +313,16 @@ iocap_enabled_tag_assign_key(bus_dma_iocap_enabled_tag_t tag,
 // If the map is in iocap_dmamap_loaded, does nothing.
 // If the map is otherwise not in iocap_dmamap_key_selected, asserts.
 //
-// When the refcount hits zero, call iocap_keymngr_clear_key() to clear the key data but keep the key index allocated.
+// When the refcount hits zero, call iocap_keymngr_clear_key() to clear the key data, and call all quarantine callbacks, but keep the key index allocated.
+//
+// If cb is not NULL and the refcount hits zero, calls cb(cb_arg1, cb_arg2) after the other quarantine callbacks.
+// If cb is not NULL and the refcount doesn't hit 0, enqueues (cb, cb_arg1, cb_arg2) to the relevant quarantine queue.
 //
 // Takes the key allocator mutex for the tag if the map is in iocap_dmamap_key_selected.
 static int
 iocap_enabled_tag_unassign_key(bus_dma_iocap_enabled_tag_t tag,
-		bus_iocap_dmamap_t map);
+	bus_iocap_dmamap_t map, iocap_keymngr_bus_dmamap_unload2_cb cb,
+	void* cb_arg1, void* cb_arg2);
 
 
 static int
@@ -488,8 +521,7 @@ iocap_keymngr_dbg_perfcounters_sysctl(SYSCTL_HANDLER_ARGS)
 }
 
 // Assign n_key_ids key IDs to a tag, without reusing key IDs already assigned to other tags
-static int iocap_keymngr_alloc_key_ids(device_t dev, struct iocap_key_state *key_states,
-		uint8_t n_key_states)
+static int iocap_keymngr_alloc_key_ids(device_t dev, struct iocap_key_suballocator *key_suballoc)
 {
 	struct iocap_keymngr_softc *sc;
 
@@ -498,7 +530,7 @@ static int iocap_keymngr_alloc_key_ids(device_t dev, struct iocap_key_state *key
 	// Lock key manager
 	mtx_lock(&sc->iocap_keymngr_mtx);
 
-	if (BIT_COUNT(256, &sc->available_keys) < n_key_states) {
+	if (BIT_COUNT(256, &sc->available_keys) < key_suballoc->n_keys) {
 		// Unlock key manager
 		mtx_unlock(&sc->iocap_keymngr_mtx);
 
@@ -507,20 +539,20 @@ static int iocap_keymngr_alloc_key_ids(device_t dev, struct iocap_key_state *key
 
 	// Search for the right number of keys in the bitmask, then save which ones we want to take.
 	// Don't count them as taken yet, because we might not find them all.
-	for (uint8_t i = 0; i < n_key_states; i++) {
+	for (uint8_t i = 0; i < key_suballoc->n_keys; i++) {
 		// TODO go back to rolling my own bitset, this one doesn't even use _clz
 		uint16_t key_plus_one = BIT_FFS(256, &sc->available_keys);
 
 		KASSERT(key_plus_one > 0, ("iocap_keymngr_alloc_key_ids had BIT_COUNT space but didn't find a set bit\n"));
 
-		key_states[i].key_id = key_plus_one - 1;
+		key_suballoc->key_datas[i].key_id = key_plus_one - 1;
 	}
 
-	device_printf(dev, "Allocated the following %d IOCap key ids\n", n_key_states);
+	device_printf(dev, "Allocated the following %d IOCap key ids\n", key_suballoc->n_keys);
 
 	// Now we know we have them all, we can mark them as taken
-	for (uint8_t i = 0; i < n_key_states; i++) {
-		uint8_t key_id = key_states[i].key_id;
+	for (uint8_t i = 0; i < key_suballoc->n_keys; i++) {
+		uint8_t key_id = key_suballoc->key_datas[i].key_id;
 		BIT_CLR(256, key_id, &sc->available_keys);
 		device_printf(dev, "key #%d\n", key_id);
 	}
@@ -567,47 +599,14 @@ static void iocap_keymngr_init_key(device_t dev, struct iocap_key_state* key_sta
 	bus_space_write_8(sc->bst, sc->bsh, 0x0 + (key_state->key_id << 4), 1);
 }
 
-/*
- *
-// Retrieve the key data for this id so we can use it to mint an IOCap,
-// and takes the lock on the key so it doesn't change while minting.
-// Return NULL if not inited, and still takes the lock in this case.
-// Must call iocap_keymngr_unlock_key() after using the key to release it to others.
-static CCapU128 *iocap_keymngr_get_and_lock_key(device_t dev, uint8_t key_id)
-{
-	struct iocap_keymngr_softc *sc;
-
-	sc = device_get_softc(dev);
-
-	// TODO take lock on key?
-
-	if (!sc->keys[key_id].active) {
-		return NULL;
-	}
-
-	return &sc->keys[key_id].key_data;
-}
-
-static void iocap_keymngr_unlock_key(device_t dev, struct iocap_key_state* key_data)
-{
-	// struct iocap_keymngr_softc *sc;
-	//
-	// sc = device_get_softc(dev);
-
-	// TODO release lock on key?
-}
-*/
-
 // Clear out the key data for this ID.
 //
-// Assumes the relevant key allocator mutex is held.
+// Assumes the relevant key suballocator mutex is held.
 static void iocap_keymngr_clear_key(device_t dev, struct iocap_key_state* key_state)
 {
 	struct iocap_keymngr_softc *sc;
 
 	sc = device_get_softc(dev);
-
-	// TODO take lock on key?
 
 	KASSERT(key_state->active,
 		("Key %d must be active to clear it", key_state->key_id));
@@ -624,15 +623,14 @@ static void iocap_keymngr_clear_key(device_t dev, struct iocap_key_state* key_st
 		// wait until the MMIO device confirms revocation with
 		// key status == 0
 	}
-
-	// TODO release lock on key?
 }
 
-// Clear data for all given key IDs in a DMA tag and mark them as not-allocated in the device so other tags can reuse them.
+// Clear data for all given key IDs in a key suballocator and mark them as not-allocated in the device so other tags can reuse them.
+// TODO need some way to ensure this doesn't leave a key open and usable,
 //
-// Assumes the relevant key allocator mutex is held.
-static void iocap_keymngr_free_key_ids(device_t dev, struct iocap_key_state const *key_states,
-		uint8_t n_key_states)
+// Assumes the relevant key suballocator mutex is held.
+// Takes the key manager mutex.
+static void iocap_keymngr_free_key_ids(device_t dev, struct iocap_key_suballocator* key_suballoc)
 {
 	struct iocap_keymngr_softc *sc;
 
@@ -641,14 +639,14 @@ static void iocap_keymngr_free_key_ids(device_t dev, struct iocap_key_state cons
 	// Lock key manager
 	mtx_lock(&sc->iocap_keymngr_mtx);
 
-	KASSERT(n_key_states + BIT_COUNT(256, &sc->available_keys) <= 256,
+	KASSERT(key_suballoc->n_keys + BIT_COUNT(256, &sc->available_keys) <= 256,
 		("Inconsistency: somehow we are freeing %d key IDs but already have %ld available.",
-			n_key_states, BIT_COUNT(256, &sc->available_keys)));
+			key_suballoc->n_keys, BIT_COUNT(256, &sc->available_keys)));
 
-	for (int i = 0; i < n_key_states; i++) {
+	for (int i = 0; i < key_suballoc->n_keys; i++) {
 		uint8_t key_id;
 
-		key_id = key_states[i].key_id;
+		key_id = key_suballoc->key_datas[i].key_id;
 
 		BIT_SET(256, key_id, &sc->available_keys);
 	}
@@ -667,47 +665,74 @@ static int
 iocap_enabled_tag_assign_key(bus_dma_iocap_enabled_tag_t tag,
 		bus_iocap_dmamap_t map)
 {
+	struct iocap_key_suballocator* key_suballoc = &tag->key_suballoc;
+
 	// Take the key alloc lock
-	mtx_lock(&tag->key_alloc_mtx);
+	mtx_lock(&key_suballoc->mtx);
 
 	// TODO depending on revocation strategy we should change this
-	uint8_t nth_key_of_tag = 0;
-	map->nth_key_of_tag = nth_key_of_tag;
+	uint8_t nth_key_of_tag = 0xFF;
+
+	switch (key_suballoc->params.mode) {
+	case iocap_revoke_when_no_mappings_unsafe: {
+		nth_key_of_tag = 0;
+		uint64_t refcount = key_suballoc->single_refcounted_key.active_mappings + 1;
+		KASSERT(refcount != 0,
+			("%s - overflowed refcount for single refcounted key of tag %p",
+				device_get_name(tag->iocap_keymngr), tag));
+		if (refcount == 1) {
+			struct iocap_key_state* key_state = &key_suballoc->key_datas[nth_key_of_tag];
+			// device_printf(tag->iocap_keymngr, "Activating IOCap key %d\n", key_state->key_id);
+			iocap_keymngr_init_key(tag->iocap_keymngr, key_state);
+		}
+		key_suballoc->single_refcounted_key.active_mappings = refcount;
+		key_suballoc->single_refcounted_key.total_mappings++;
+		break;
+	}
+	// case iocap_rolling_epoch_x4: {
+	// 	// TODO
+	// 	break;
+	// }
+	}
+
+	map->nth_key_of_tag = nth_key_of_tag; // TODO KASSERT nth_key_of_tag != 0xFF
 	KASSERT(map->state == iocap_dmamap_loaded,
 			("Tried to complete a DMA map after it was completed %d", map->state));
 	map->state = iocap_dmamap_key_selected;
 
-	tag->key_refcounts[nth_key_of_tag]++;
-	KASSERT(tag->key_refcounts[nth_key_of_tag] != 0,
-		("%s - overflowed refcount for key %d of tag %p",
-			device_get_name(tag->iocap_keymngr), nth_key_of_tag,
-			tag));
-	if (tag->key_max_refcounts[nth_key_of_tag] < tag->key_refcounts[nth_key_of_tag]) {
-		tag->key_max_refcounts[nth_key_of_tag]++;
-	}
-	if (tag->key_refcounts[nth_key_of_tag] == 1) {
-		struct iocap_key_state* key_state = &tag->allocated_keys[nth_key_of_tag];
-		// device_printf(tag->iocap_keymngr, "Activating IOCap key %d\n", key_state->key_id);
-		iocap_keymngr_init_key(tag->iocap_keymngr, key_state);
-	}
-
 	// Unlock the key alloc lock
-	mtx_unlock(&tag->key_alloc_mtx);
+	mtx_unlock(&key_suballoc->mtx);
 
 	return 0;
+}
+
+static void flush_quarantines(struct iocap_keymngr_quarantine_queue* list)
+{
+	struct iocap_keymngr_quarantined_mem_cb* entry;
+	while (!SLIST_EMPTY(list)) {
+		entry = SLIST_FIRST(list);
+		SLIST_REMOVE_HEAD(list, entries);
+		entry->cb(entry->cb_arg1, entry->cb_arg2);
+		free(entry, M_IOCAP_DMAMAP_QUARANTINE);
+	}
 }
 
 // Decrement the refcount for a map's key on a given tag and transitions the map to iocap_dmamap_unloaded.
 // If the map is in iocap_dmamap_loaded, does nothing.
 // If the map is otherwise not in iocap_dmamap_key_selected, asserts.
 //
-// When the refcount hits zero, call iocap_keymngr_clear_key() to clear the key data but keep the key index allocated.
+// When the refcount hits zero, call iocap_keymngr_clear_key() to clear the key data, and call all quarantine callbacks, but keep the key index allocated.
+//
+// If cb is not NULL and the refcount hits zero, calls cb(cb_arg1, cb_arg2) after the other quarantine callbacks.
+// If cb is not NULL and the refcount doesn't hit 0, enqueues (cb, cb_arg1, cb_arg2) to the relevant quarantine queue.
 //
 // Takes the key allocator mutex for the tag if the map is in iocap_dmamap_key_selected.
 static int
 iocap_enabled_tag_unassign_key(bus_dma_iocap_enabled_tag_t tag,
-		bus_iocap_dmamap_t map)
+		bus_iocap_dmamap_t map, iocap_keymngr_bus_dmamap_unload2_cb cb,
+		void* cb_arg1, void* cb_arg2)
 {
+	struct iocap_key_suballocator* key_suballoc = &tag->key_suballoc;
 
 	if (map->state == iocap_dmamap_loaded) {
 		// No key assigned
@@ -719,26 +744,52 @@ iocap_enabled_tag_unassign_key(bus_dma_iocap_enabled_tag_t tag,
 			("Tried to unload a DMA map when it was not loaded"));
 
 	// Take the key alloc lock
-	mtx_lock(&tag->key_alloc_mtx);
+	mtx_lock(&key_suballoc->mtx);
 
-	uint8_t nth_key_of_tag = map->nth_key_of_tag;
-	tag->key_refcounts[nth_key_of_tag]--;
-	if (tag->key_refcounts[nth_key_of_tag] == 0) {
-		struct iocap_key_state* key_state = &tag->allocated_keys[nth_key_of_tag];
-		if (tag->key_max_refcounts[nth_key_of_tag] > 1)
-			device_printf(tag->iocap_keymngr,
-				"Deactivating IOCap key %d with max refcount %zu\n",
-				key_state->key_id, tag->key_max_refcounts[nth_key_of_tag]);
-		iocap_keymngr_clear_key(tag->iocap_keymngr, key_state);
+	switch (key_suballoc->params.mode) {
+	case iocap_revoke_when_no_mappings_unsafe: {
+		uint64_t refcount = key_suballoc->single_refcounted_key.active_mappings - 1;
+		if (refcount == 0) {
+			if (key_suballoc->single_refcounted_key.total_mappings > 1) {
+				device_printf(tag->iocap_keymngr,
+					"Deactivating IOCap key %d with max refcount %zu\n",
+					key_suballoc->key_datas[0].key_id, key_suballoc->single_refcounted_key.total_mappings);
+			}
 
-		tag->key_max_refcounts[nth_key_of_tag] = 0;
+			struct iocap_key_state* key_state = &key_suballoc->key_datas[0];
+			// device_printf(tag->iocap_keymngr, "Deactivating IOCap key %d\n", key_state->key_id);
+			iocap_keymngr_clear_key(tag->iocap_keymngr, key_state);
+
+			flush_quarantines(&key_suballoc->single_refcounted_key.quarantine);
+			if (cb != NULL) {
+				cb(cb_arg1, cb_arg2);
+			}
+
+			// Reset the key state
+			memset(&key_suballoc->single_refcounted_key, 0, sizeof(key_suballoc->single_refcounted_key));
+		} else if (cb != NULL) {
+			struct iocap_keymngr_quarantined_mem_cb* cb_entry = malloc(
+				sizeof(struct iocap_keymngr_quarantined_mem_cb),
+				M_IOCAP_DMAMAP_QUARANTINE, M_NOWAIT);
+			cb_entry->cb = cb;
+			cb_entry->cb_arg1 = cb_arg1;
+			cb_entry->cb_arg2 = cb_arg2;
+			SLIST_INSERT_HEAD(&key_suballoc->single_refcounted_key.quarantine, cb_entry, entries);
+		}
+		key_suballoc->single_refcounted_key.active_mappings = refcount;
+		break;
+	}
+	// case iocap_rolling_epoch_x4: {
+	// 	// TODO
+	// 	break;
+	// }
 	}
 
 	map->nth_key_of_tag = 0xFF;
 	map->state = iocap_dmamap_unloaded;
 
 	// Unlock the key alloc lock
-	mtx_unlock(&tag->key_alloc_mtx);
+	mtx_unlock(&key_suballoc->mtx);
 
 	return 0;
 }
@@ -990,7 +1041,7 @@ _iocap_enabled_destroy_map_common(bus_dma_iocap_enabled_tag_t tag,
 {
 	if (map->state == iocap_dmamap_loaded) {
 		device_printf(tag->iocap_keymngr, "Destroying an IOCap map that hadn't been unloaded?");
-		iocap_enabled_tag_unassign_key(tag, map);
+		iocap_enabled_tag_unassign_key(tag, map, NULL, NULL, NULL);
 	}
 
 	// TODO if we end up putting a lock in each dmamap like IOMMU does, destroy it here
@@ -1028,15 +1079,15 @@ iocap_enabled_tag_destroy(bus_dma_tag_t dmat)
 	error = 0;
 
 	// Lock the key allocator mutex
-	mtx_lock(&iocap_dmat->key_alloc_mtx);
+	mtx_lock(&iocap_dmat->key_suballoc.mtx);
 
 	// This implicitly makes all mappings from this tag inaccessible :)
 	iocap_keymngr_free_key_ids(iocap_dmat->iocap_keymngr,
-			iocap_dmat->allocated_keys, iocap_dmat->n_keys);
+			&iocap_dmat->key_suballoc);
 
 	// Unlock and destroy the key allocator mutex now we definitely aren't using it
-	mtx_unlock(&iocap_dmat->key_alloc_mtx);
-	mtx_destroy(&iocap_dmat->key_alloc_mtx);
+	mtx_unlock(&iocap_dmat->key_suballoc.mtx);
+	mtx_destroy(&iocap_dmat->key_suballoc.mtx);
 
 	error = base_impl->tag_destroy(iocap_dmat->base_tag);
 
@@ -1275,13 +1326,7 @@ iocap_enabled_map_waitok(bus_dma_tag_t dmat, bus_dmamap_t map,
 // struct iocap_keymngr_decref_key_action {
 // 	uint8_t key_index;
 // };
-
-// TODO HIT ME WITH THE CALLBACKS BABY
-struct iocap_keymngr_quarantined_mem_callback {
-	iocap_keymngr_bus_dmamap_unload2_cb callback;
-	void* arg1;
-	void* arg2;
-};
+// TODO look back at this
 
 // Finish loading memory into the IOCap. Allocates a key from the parent tag
 // now that we are exposing memory.
@@ -1322,7 +1367,22 @@ iocap_enabled_map_unload(bus_dma_tag_t dmat, bus_dmamap_t map)
 	iocap_map = (struct bus_iocap_dmamap *)map;
 
 	// Transitions map to unloaded
-	iocap_enabled_tag_unassign_key(iocap_dmat, iocap_map);
+	iocap_enabled_tag_unassign_key(iocap_dmat, iocap_map, NULL, NULL, NULL);
+
+	base_impl->map_unload(iocap_dmat->base_tag, iocap_map->base_map);
+}
+
+// version of bus_dmamap_unload with a callback, see iocap_keymngr.h
+void
+iocap_keymngr_bus_dmamap_unload2(bus_dma_iocap_enabled_tag_t iocap_dmat, bus_iocap_dmamap_t iocap_map,
+	iocap_keymngr_bus_dmamap_unload2_cb on_unmapped, void* arg1, void* arg2)
+{
+	struct bus_dma_impl *base_impl;
+
+	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
+
+	// Transitions map to unloaded
+	iocap_enabled_tag_unassign_key(iocap_dmat, iocap_map, on_unmapped, arg1, arg2);
 
 	base_impl->map_unload(iocap_dmat->base_tag, iocap_map->base_map);
 }
@@ -1342,10 +1402,10 @@ iocap_enabled_map_sync(bus_dma_tag_t dmat, bus_dmamap_t map,
 	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
 	iocap_map = (struct bus_iocap_dmamap *)map;
 
-	// Transitions the map to "key-assigned" state if not already there
-	if (iocap_map->state == iocap_dmamap_loaded) {
-		iocap_enabled_tag_assign_key(iocap_dmat, iocap_map);
-	}
+	// // Transitions the map to "key-assigned" state if not already there
+	// if (iocap_map->state == iocap_dmamap_loaded && (op == BUS_DMASYNC_PREREAD || op == BUS_DMASYNC_PREWRITE)) {
+	// 	iocap_enabled_tag_assign_key(iocap_dmat, iocap_map);
+	// }
 
 	base_impl->map_sync(iocap_dmat->base_tag, iocap_map->base_map, op);
 }
@@ -1398,18 +1458,21 @@ bus_dma_tag_refine_to_iocap_group(bus_dma_iocap_refinable_tag_t tag,
 		return EPERM;
 	}
 
+	uint8_t n_keys;
+
 	switch (params.mode) {
 	case iocap_revoke_when_no_mappings_unsafe: {
-		if (params.n_keys != 1) {
-			return EINVAL;
-		}
+		n_keys = 1;
 		break;
 	}
+	// case iocap_rolling_epoch_x4: {
+	// 	if (params.params.rolling_epoch.max_bytes_mapped_per_epoch == 0 && params.params.rolling_epoch.max_num_mappings_per_epoch) {
+	// 		return EINVAL;
+	// 	}
+	// 	n_keys = 4;
+	// 	break;
+	// }
 	default:
-		return EINVAL;
-	}
-
-	if (params.n_keys > MAX_NUM_KEYS_PER_TAG) {
 		return EINVAL;
 	}
 
@@ -1420,16 +1483,14 @@ bus_dma_tag_refine_to_iocap_group(bus_dma_iocap_refinable_tag_t tag,
 	new_tag->common.impl = &bus_dma_iocap_enabled_tag_impl;
 	new_tag->base_tag = tag->base_tag;
 	new_tag->iocap_keymngr = tag->iocap_keymngr;
-	new_tag->revocation_mode = params.mode;
-	new_tag->n_keys = params.n_keys;
-	// TODO lol what is the C99 syntax for zero-init
-	// new_tag->allocated_keys = {0};
-	// new_tag->key_refcounts = {0};
-	new_tag->map_count = 0;
-	mtx_init(&new_tag->key_alloc_mtx, "IOCap DMA Tag Key Allocation Mutex", NULL, MTX_DEF);
+	new_tag->key_suballoc = (struct iocap_key_suballocator) {0};
+	new_tag->key_suballoc.n_keys = n_keys;
+	new_tag->key_suballoc.params = params;
+
+	mtx_init(&new_tag->key_suballoc.mtx, "IOCap DMA Tag Key Allocation Mutex", NULL, MTX_DEF);
 
 	int error = iocap_keymngr_alloc_key_ids(tag->iocap_keymngr,
-			new_tag->allocated_keys, params.n_keys);
+			&new_tag->key_suballoc);
 	if (error) {
 		free(new_tag, M_IOCAP_DMAMAP);
 		*out = NULL;
@@ -1498,8 +1559,8 @@ bus_dmamap_mint_iocap(bus_iocap_dmamap_t map, bus_dma_segment_t *segment,
 	// While the mapping is in the key_selected state, we assume the state of the indicated key is valid.
 	// We do not need to take a lock on the key.
 
-	key_id = map->tag->allocated_keys[map->nth_key_of_tag].key_id;
-	key = &map->tag->allocated_keys[map->nth_key_of_tag].key_data;
+	key_id = map->tag->key_suballoc.key_datas[map->nth_key_of_tag].key_id;
+	key = &map->tag->key_suballoc.key_datas[map->nth_key_of_tag].key_data;
 	res = CCapResult_CatastrophicFailure;
 
 	if (key != NULL) {
@@ -1572,8 +1633,8 @@ bus_dmamap_mint_virtio_iocap(bus_iocap_dmamap_t map, bus_dma_segment_t *segment,
 	// While the mapping is in the key_selected state, we assume the state of the indicated key is valid.
 	// We do not need to take a lock on the key.
 
-	key_id = map->tag->allocated_keys[map->nth_key_of_tag].key_id;
-	key = &map->tag->allocated_keys[map->nth_key_of_tag].key_data;
+	key_id = map->tag->key_suballoc.key_datas[map->nth_key_of_tag].key_id;
+	key = &map->tag->key_suballoc.key_datas[map->nth_key_of_tag].key_data;
 	res = CCapResult_CatastrophicFailure;
 
 	if (key != NULL) {

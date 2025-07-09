@@ -431,7 +431,6 @@ vtblk_iocap_attach(device_t dev)
 			// This is actually fine, because we always unload all mappings together
 			// => lifetime of any given mapping = lifetime of tag
 			.mode = iocap_revoke_when_no_mappings_unsafe,
-			.n_keys = 1
 		},
 		&sc->vtblk_iocap_queues_tag
 	);
