@@ -43,6 +43,9 @@ struct sglist;
 struct vq_iocap_alloc_info {
 	char		   vqai_name[VIRTQ_IOCAP_MAX_NAME_SZ];
 	int		   vqai_maxindirsz;
+	// Function called in an ithread context, which is allowed
+	// to take mutexes but should avoid lock contention where possible.
+	// See BUS_SETUP_INTR(9)
 	virtqueue_intr_t  *vqai_intr;
 	void		  *vqai_intr_arg;
 	struct virtq_iocap **vqai_vq;
@@ -86,6 +89,7 @@ int	 virtq_iocap_nused(struct virtq_iocap *vq);
 void	 virtq_iocap_notify(struct virtq_iocap *vq);
 void	 virtq_iocap_dump(struct virtq_iocap *vq);
 
+// Does not mint IOCaps unless the return value is 0.
 int	 virtq_iocap_enqueue(struct virtq_iocap *vq, bus_iocap_dmamap_t mapp,
 	void *cookie, struct sglist *sg, int readable, int writable);
 void	*virtq_iocap_dequeue(struct virtq_iocap *vq, uint32_t *len);

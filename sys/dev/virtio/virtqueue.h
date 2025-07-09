@@ -32,7 +32,13 @@
 struct virtqueue;
 struct sglist;
 
-/* Device callback for a virtqueue interrupt. */
+/*
+ * Device callback for a virtqueue interrupt.
+ *
+ * Called in an ithread context, which is allowed to take
+ * mutexes but should avoid lock contention where possible.
+ * See BUS_SETUP_INTR(9)
+ */
 typedef void virtqueue_intr_t(void *);
 
 /*
@@ -51,6 +57,9 @@ typedef enum {
 struct vq_alloc_info {
 	char		   vqai_name[VIRTQUEUE_MAX_NAME_SZ];
 	int		   vqai_maxindirsz;
+	// Function called in an ithread context, which is allowed
+	// to take mutexes but should avoid lock contention where possible.
+	// See BUS_SETUP_INTR(9)
 	virtqueue_intr_t  *vqai_intr;
 	void		  *vqai_intr_arg;
 	struct virtqueue **vqai_vq;

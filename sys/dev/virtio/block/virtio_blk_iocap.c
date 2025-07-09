@@ -71,6 +71,8 @@ struct vtblk_iocap_request {
 	uint8_t				 vbr_ack;
 	uint8_t				 vbr_requeue_on_error;
 	uint8_t				 vbr_busdma_wait;
+	/* TODO set to 1 if it has been dequeued and is awaiting unmapping? */
+	uint8_t				 vbr_quarantined;
 	int				 vbr_error;
 	TAILQ_ENTRY(vtblk_iocap_request)	 vbr_link;
 };
@@ -444,7 +446,6 @@ vtblk_iocap_attach(device_t dev)
 		(struct iocap_keymngr_revocation_params) {
 			// TODO change this!
 			.mode = iocap_revoke_when_no_mappings_unsafe,
-			.n_keys = 1
 		},
 		&sc->vtblk_iocap_request_tag
 	);
@@ -1218,8 +1219,14 @@ vtblk_iocap_request_execute_cb(void * callback_arg, bus_dma_segment_t * segs,
 		virtq_iocap_notify(vq);
 
 out:
-	if (error && (req->vbr_mapp != NULL))
+	if (error && (req->vbr_mapp != NULL)) {
+		// If error != 0, the mapping hasn't actualy been mapped into the device's view
+		// or allocated an IOCap key yet.
+		// Therefore we can call bus_dmamap_unload to *synchronously*
+		// unmap without waiting for IOCap key epochs.
 		bus_dmamap_unload((bus_dma_tag_t)sc->vtblk_iocap_request_tag, req->vbr_mapp);
+	}
+
 out1:
 	if (error && req->vbr_requeue_on_error)
 		vtblk_iocap_request_requeue_ready(sc, req);
@@ -1246,8 +1253,14 @@ vtblk_iocap_request_error(struct vtblk_iocap_request *req)
 	return (error);
 }
 
-static struct bio *
-vtblk_iocap_queue_complete_one(struct vtblk_iocap_softc *sc, struct vtblk_iocap_request *req)
+typedef void (*vtblk_unload_cb)(struct vtblk_iocap_request *req, void* cb_arg2);
+
+// bus_dmamap_sync the memory under a request and unmap it from the device's view.
+// Immediately after this function returns, the memory it points to is usable, but it may still be accessible from the device.
+// Once the callback is called, the memory has been removed from the device view
+// and is safe to free and reuse for other purposes.
+static void
+vtblk_iocap_queue_complete_one(struct vtblk_iocap_softc *sc, struct vtblk_iocap_request *req, vtblk_unload_cb cb, void* cb_arg2)
 {
 	struct bio *bp;
 
@@ -1257,35 +1270,51 @@ vtblk_iocap_queue_complete_one(struct vtblk_iocap_softc *sc, struct vtblk_iocap_
 	}
 
 	bp = req->vbr_bp;
+	bp->bio_error = vtblk_iocap_request_error(req);
 	if (req->vbr_mapp != NULL) {
 		switch (bp->bio_cmd) {
 		case BIO_READ:
 			bus_dmamap_sync((bus_dma_tag_t)sc->vtblk_iocap_request_tag, req->vbr_mapp,
 			    BUS_DMASYNC_POSTREAD);
-			bus_dmamap_unload((bus_dma_tag_t)sc->vtblk_iocap_request_tag, req->vbr_mapp);
+			iocap_keymngr_bus_dmamap_unload2(
+				sc->vtblk_iocap_request_tag,
+				req->vbr_iocap_mapp,
+				(iocap_keymngr_bus_dmamap_unload2_cb)cb, req, cb_arg2
+				);
 			break;
 		case BIO_WRITE:
 			bus_dmamap_sync((bus_dma_tag_t)sc->vtblk_iocap_request_tag, req->vbr_mapp,
 			    BUS_DMASYNC_POSTWRITE);
-			bus_dmamap_unload((bus_dma_tag_t)sc->vtblk_iocap_request_tag, req->vbr_mapp);
+			iocap_keymngr_bus_dmamap_unload2(
+				sc->vtblk_iocap_request_tag,
+				req->vbr_iocap_mapp,
+				(iocap_keymngr_bus_dmamap_unload2_cb)cb, req, cb_arg2
+				);
 			break;
 		}
 	}
-	bp->bio_error = vtblk_iocap_request_error(req);
-	return (bp);
+}
+
+static void
+vtblk_iocap_queue_request_unloaded(struct vtblk_iocap_request *req, void* cb_arg2)
+{
+	struct bio *bp;
+	struct bio_queue *queue;
+
+	bp = req->vbr_bp;
+	queue = (struct bio_queue*) cb_arg2;
+
+	TAILQ_INSERT_TAIL(queue, bp, bio_queue);
+	vtblk_iocap_request_enqueue(req->vbr_sc, req);
 }
 
 static void
 vtblk_iocap_queue_completed(struct vtblk_iocap_softc *sc, struct bio_queue *queue)
 {
 	struct vtblk_iocap_request *req;
-	struct bio *bp;
 
 	while ((req = virtq_iocap_dequeue(sc->vtblk_iocap_vq, NULL)) != NULL) {
-		bp = vtblk_iocap_queue_complete_one(sc, req);
-
-		TAILQ_INSERT_TAIL(queue, bp, bio_queue);
-		vtblk_iocap_request_enqueue(sc, req);
+		vtblk_iocap_queue_complete_one(sc, req, vtblk_iocap_queue_request_unloaded, queue);
 	}
 }
 
@@ -1484,6 +1513,8 @@ vtblk_iocap_ident(struct vtblk_iocap_softc *sc)
 	buf.bio_data = dp->d_ident;
 	buf.bio_bcount = len;
 
+	// TODO Make this asynchronous, we really don't want to hand out
+	// full access to this struct
 	VTBLK_LOCK(sc);
 	error = vtblk_iocap_poll_request(sc, req);
 	VTBLK_UNLOCK(sc);
@@ -1494,6 +1525,7 @@ vtblk_iocap_ident(struct vtblk_iocap_softc *sc)
 	}
 }
 
+// THIS FUNCTION IS FAKE AND FOR THINGS THAT REALLY DONT CARE ABOUT MEMORY SECURITY
 static int
 vtblk_iocap_poll_request(struct vtblk_iocap_softc *sc, struct vtblk_iocap_request *req)
 {
@@ -1516,7 +1548,9 @@ vtblk_iocap_poll_request(struct vtblk_iocap_softc *sc, struct vtblk_iocap_reques
 	KASSERT(req == req1,
 	    ("%s: polling completed %p not %p", __func__, req1, req));
 
-	bp = vtblk_iocap_queue_complete_one(sc, req);
+	// NOTE THIS SETS CALLBACK TO NULL BECAUSE IT DOESNT CARE ABOUT MEMORY SECURITY
+	vtblk_iocap_queue_complete_one(sc, req, NULL, NULL);
+	bp = req->vbr_bp;
 	error = bp->bio_error;
 	if (error && bootverbose) {
 		device_printf(sc->vtblk_iocap_dev,
