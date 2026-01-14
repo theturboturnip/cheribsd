@@ -1189,7 +1189,6 @@ vtblk_request_error(struct vtblk_request *req)
 	return (error);
 }
 
-// SAMUEL NOTE: THIS FUNCTION SHOULD TAKE A CALLBACK
 static struct bio *
 vtblk_queue_complete_one(struct vtblk_softc *sc, struct vtblk_request *req)
 {
@@ -1228,7 +1227,6 @@ vtblk_queue_completed(struct vtblk_softc *sc, struct bio_queue *queue)
 	while ((req = virtqueue_dequeue(sc->vtblk_vq, NULL)) != NULL) {
 		bp = vtblk_queue_complete_one(sc, req);
 
-		// SAMUEL NOTE: THIS IS WHAT WE NEED THE CALLBACK TO DO
 		TAILQ_INSERT_TAIL(queue, bp, bio_queue);
 		vtblk_request_enqueue(sc, req);
 	}
