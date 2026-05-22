@@ -441,24 +441,6 @@ vtblk_iocap_attach(device_t dev)
 		goto fail;
 	}
 
-	error = bus_dma_tag_refine_to_iocap_group(
-		refinable_tag,
-		(struct iocap_keymngr_revocation_params) {
-			.mode = iocap_rolling_epoch_x4,
-			.params = {
-				.rolling_epoch = {
-					// TODO change this!
-					.max_num_mappings_per_epoch = 1,
-				}
-			}
-		},
-		&sc->vtblk_iocap_request_tag
-	);
-	if (error) {
-		device_printf(dev, "cannot refine bus dma tag to iocap group for holding requests for queue #0\n");
-		goto fail;
-	}
-
 #ifdef __powerpc__
 	/*
 	 * Virtio uses physical addresses rather than bus addresses, so we
@@ -471,6 +453,26 @@ vtblk_iocap_attach(device_t dev)
 	error = vtblk_iocap_alloc_virtqueue(sc);
 	if (error) {
 		device_printf(dev, "cannot allocate virtqueue\n");
+		goto fail;
+	}
+
+	error = bus_dma_tag_refine_to_iocap_group(
+		refinable_tag,
+		(struct iocap_keymngr_revocation_params) {
+			.mode = iocap_rolling_epoch_x4,
+			.params = {
+				.rolling_epoch = {
+					// As per thesis: l_ops = ceil(q_ops / (n_l - 1)), ceil(x / y) with integer division = (x + y - 1) /
+					// This assumes virtio forces in-order consumption + enqueueing, even in the precense of out-of-order completion
+					// TODO is that true?
+					.max_num_mappings_per_epoch = (virtq_iocap_size(sc->vtblk_iocap_vq) + 2) / 3,
+				}
+			}
+		},
+		&sc->vtblk_iocap_request_tag
+	);
+	if (error) {
+		device_printf(dev, "cannot refine bus dma tag to iocap group for holding requests for queue #0\n");
 		goto fail;
 	}
 
