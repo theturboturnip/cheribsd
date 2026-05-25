@@ -163,6 +163,7 @@ typedef void (*iocap_keymngr_bus_dmamap_unload2_cb)(void* arg1, void* arg2);
 // until the callback is called.
 // The callback may be called immediately, and should not call any functions related to IOCaps
 // as locks may be held.
+// If the callback is NULL, synchronous revocation is assumed - an assertion will fire if we would encounter over-exposure.
 void iocap_keymngr_bus_dmamap_unload2(bus_dma_iocap_enabled_tag_t tag,
 	bus_iocap_dmamap_t map, iocap_keymngr_bus_dmamap_unload2_cb on_unmapped,
 	void* arg1, void* arg2);

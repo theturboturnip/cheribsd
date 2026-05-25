@@ -70,6 +70,7 @@ struct iocap_key_state {
 
 struct iocap_keymngr_quarantined_mem_cb {
 	SLIST_ENTRY(iocap_keymngr_quarantined_mem_cb) entries;
+	bus_iocap_dmamap_t map;
 	iocap_keymngr_bus_dmamap_unload2_cb cb;
 	void* cb_arg1;
 	void* cb_arg2;
@@ -322,7 +323,7 @@ iocap_enabled_tag_assign_key(bus_dma_iocap_enabled_tag_t tag,
 static int
 iocap_enabled_tag_unassign_key(bus_dma_iocap_enabled_tag_t tag,
 	bus_iocap_dmamap_t map, iocap_keymngr_bus_dmamap_unload2_cb cb,
-	void* cb_arg1, void* cb_arg2);
+	void* cb_arg1, void* cb_arg2, bool force_synchronous_revoke);
 
 
 static int
@@ -749,10 +750,21 @@ iocap_enabled_tag_assign_key(bus_dma_iocap_enabled_tag_t tag,
 static void flush_quarantines(struct iocap_keymngr_quarantine_queue* list)
 {
 	struct iocap_keymngr_quarantined_mem_cb* entry;
+
+	struct bus_iocap_dmamap *iocap_map;
+	struct bus_dma_iocap_enabled_tag *iocap_dmat;
+	struct bus_dma_impl *base_impl;
+
 	while (!SLIST_EMPTY(list)) {
 		entry = SLIST_FIRST(list);
 		SLIST_REMOVE_HEAD(list, entries);
 		entry->cb(entry->cb_arg1, entry->cb_arg2);
+
+		iocap_map = entry->map;
+		iocap_dmat = iocap_map->tag;
+		base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
+		base_impl->map_unload(iocap_dmat->base_tag, iocap_map->base_map);
+
 		free(entry, M_IOCAP_DMAMAP_QUARANTINE);
 	}
 }
@@ -763,20 +775,27 @@ static void flush_quarantines(struct iocap_keymngr_quarantine_queue* list)
 //
 // When the refcount hits zero, call iocap_keymngr_clear_key() to clear the key data, and call all quarantine callbacks, but keep the key index allocated.
 //
-// If cb is not NULL and the refcount hits zero, calls cb(cb_arg1, cb_arg2) after the other quarantine callbacks.
-// If cb is not NULL and the refcount doesn't hit 0, enqueues (cb, cb_arg1, cb_arg2) to the relevant quarantine queue.
+// If cb is not NULL and the refcount hits zero, calls cb(cb_arg1, cb_arg2) and map_unload on the base_impl after the other quarantine callbacks.
+// If cb is not NULL and the refcount doesn't hit 0, enqueues (cb, cb_arg1, cb_arg2, base_impl.map_unload) to the relevant quarantine queue.
 //
 // Takes the key allocator mutex for the tag if the map is in iocap_dmamap_key_selected.
 static int
 iocap_enabled_tag_unassign_key(bus_dma_iocap_enabled_tag_t tag,
 		bus_iocap_dmamap_t map, iocap_keymngr_bus_dmamap_unload2_cb cb,
-		void* cb_arg1, void* cb_arg2)
+		void* cb_arg1, void* cb_arg2, bool force_synchronous_revoke)
 {
 	struct iocap_key_suballocator* key_suballoc = &tag->key_suballoc;
 
 	if (map->state == iocap_dmamap_loaded) {
 		// No key assigned
 		map->state = iocap_dmamap_unloaded;
+		// Unmap the base mapping
+		struct bus_dma_iocap_enabled_tag *iocap_dmat;
+		struct bus_dma_impl *base_impl;
+
+		iocap_dmat = map->tag;
+		base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
+		base_impl->map_unload(iocap_dmat->base_tag, map->base_map);
 		return 0;
 	}
 
@@ -786,6 +805,7 @@ iocap_enabled_tag_unassign_key(bus_dma_iocap_enabled_tag_t tag,
 	// Take the key alloc lock
 	mtx_lock(&key_suballoc->mtx);
 
+	struct iocap_keymngr_quarantine_queue* quarantine_in_queue = NULL;
 	switch (key_suballoc->params.mode) {
 	case iocap_revoke_when_no_mappings_unsafe: {
 		uint64_t refcount = key_suballoc->single_refcounted_key.active_mappings - 1;
@@ -800,21 +820,13 @@ iocap_enabled_tag_unassign_key(bus_dma_iocap_enabled_tag_t tag,
 			// device_printf(tag->iocap_keymngr, "Deactivating IOCap key %d\n", key_state->key_id);
 			iocap_keymngr_clear_key(tag->iocap_keymngr, key_state);
 
-			flush_quarantines(&key_suballoc->single_refcounted_key.quarantine);
-			if (cb != NULL) {
-				cb(cb_arg1, cb_arg2);
-			}
+			// Don't place the callback in a queue. Call it immediately.
+			quarantine_in_queue = NULL;
 
 			// Reset the key state
 			memset(&key_suballoc->single_refcounted_key, 0, sizeof(key_suballoc->single_refcounted_key));
 		} else if (cb != NULL) {
-			struct iocap_keymngr_quarantined_mem_cb* cb_entry = malloc(
-				sizeof(struct iocap_keymngr_quarantined_mem_cb),
-				M_IOCAP_DMAMAP_QUARANTINE, M_NOWAIT);
-			cb_entry->cb = cb;
-			cb_entry->cb_arg1 = cb_arg1;
-			cb_entry->cb_arg2 = cb_arg2;
-			SLIST_INSERT_HEAD(&key_suballoc->single_refcounted_key.quarantine, cb_entry, entries);
+			quarantine_in_queue = &key_suballoc->single_refcounted_key.quarantine;
 		}
 		key_suballoc->single_refcounted_key.active_mappings = refcount;
 		break;
@@ -843,12 +855,8 @@ iocap_enabled_tag_unassign_key(bus_dma_iocap_enabled_tag_t tag,
 			// device_printf(tag->iocap_keymngr, "Deactivating IOCap key %d\n", key_state->key_id);
 			iocap_keymngr_clear_key(tag->iocap_keymngr, key_state);
 
-			// Flush any quarantines
-			flush_quarantines(&key_suballoc->rolling_epochs_x4.key_stats[key_id].quarantine);
-			// Call this quarantine callback
-			if (cb != NULL) {
-				cb(cb_arg1, cb_arg2);
-			}
+			// Don't place the callback in a queue. Call it immediately.
+			quarantine_in_queue = NULL;
 
 			// If the tag is_full, set the insertion_key and set is_full = false
 			if (key_suballoc->rolling_epochs_x4.is_full) {
@@ -861,17 +869,44 @@ iocap_enabled_tag_unassign_key(bus_dma_iocap_enabled_tag_t tag,
 			key_suballoc->rolling_epochs_x4.key_stats[key_id].num_mappings_left = key_suballoc->params.params.rolling_epoch.max_num_mappings_per_epoch;
 		} else if (cb != NULL) {
 			// Otherwise just add to the quarantine
-			struct iocap_keymngr_quarantined_mem_cb* cb_entry = malloc(
-				sizeof(struct iocap_keymngr_quarantined_mem_cb),
-				M_IOCAP_DMAMAP_QUARANTINE, M_NOWAIT);
-			cb_entry->cb = cb;
-			cb_entry->cb_arg1 = cb_arg1;
-			cb_entry->cb_arg2 = cb_arg2;
-			SLIST_INSERT_HEAD(&key_suballoc->rolling_epochs_x4.key_stats[key_id].quarantine, cb_entry, entries);
+			quarantine_in_queue = &key_suballoc->rolling_epochs_x4.key_stats[key_id].quarantine;
 		}
 		key_suballoc->rolling_epochs_x4.key_stats[key_id].active_mappings = refcount;
 		break;
 	}
+	}
+
+	if (force_synchronous_revoke) {
+		device_printf(tag->iocap_keymngr,
+					"Assuming synchronous revocation\n");
+		KASSERT(quarantine_in_queue == NULL,
+		("Called unassign_key with force_synchronous_revoke enabled, but tried to quarantine instead!"
+		));
+	}
+
+	if (quarantine_in_queue) {
+		struct iocap_keymngr_quarantined_mem_cb* cb_entry = malloc(
+			sizeof(struct iocap_keymngr_quarantined_mem_cb),
+			M_IOCAP_DMAMAP_QUARANTINE, M_NOWAIT);
+		cb_entry->map = map;
+		cb_entry->cb = cb;
+		cb_entry->cb_arg1 = cb_arg1;
+		cb_entry->cb_arg2 = cb_arg2;
+		SLIST_INSERT_HEAD(quarantine_in_queue, cb_entry, entries);
+	} else {
+		// Call their callbacks and unmap their mappings
+		flush_quarantines(&key_suballoc->single_refcounted_key.quarantine);
+		// Call this callback
+		if (cb != NULL) {
+			cb(cb_arg1, cb_arg2);
+		}
+		// Unmap the base mapping
+		struct bus_dma_iocap_enabled_tag *iocap_dmat;
+		struct bus_dma_impl *base_impl;
+
+		iocap_dmat = map->tag;
+		base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
+		base_impl->map_unload(iocap_dmat->base_tag, map->base_map);
 	}
 
 	map->nth_key_of_tag = 0xFF;
@@ -1130,7 +1165,7 @@ _iocap_enabled_destroy_map_common(bus_dma_iocap_enabled_tag_t tag,
 {
 	if (map->state == iocap_dmamap_loaded) {
 		device_printf(tag->iocap_keymngr, "Destroying an IOCap map that hadn't been unloaded?");
-		iocap_enabled_tag_unassign_key(tag, map, NULL, NULL, NULL);
+		iocap_enabled_tag_unassign_key(tag, map, NULL, NULL, NULL, false);
 	}
 
 	// TODO if we end up putting a lock in each dmamap like IOMMU does, destroy it here
@@ -1445,20 +1480,13 @@ static void
 iocap_enabled_map_unload(bus_dma_tag_t dmat, bus_dmamap_t map)
 {
 	struct bus_dma_iocap_enabled_tag *iocap_dmat;
-	struct bus_dma_impl *base_impl;
 	struct bus_iocap_dmamap *iocap_map;
 
 	iocap_dmat = (struct bus_dma_iocap_enabled_tag *)dmat;
-
-	// device_printf(iocap_dmat->iocap_keymngr, "%s\n", __func__);
-
-	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
 	iocap_map = (struct bus_iocap_dmamap *)map;
 
-	// Transitions map to unloaded
-	iocap_enabled_tag_unassign_key(iocap_dmat, iocap_map, NULL, NULL, NULL);
-
-	base_impl->map_unload(iocap_dmat->base_tag, iocap_map->base_map);
+	// Use force_synchronous_revoke to hit an assert if this would cause over-exposure.
+	iocap_enabled_tag_unassign_key(iocap_dmat, iocap_map, NULL, NULL, NULL, true);
 }
 
 // version of bus_dmamap_unload with a callback, see iocap_keymngr.h
@@ -1466,14 +1494,8 @@ void
 iocap_keymngr_bus_dmamap_unload2(bus_dma_iocap_enabled_tag_t iocap_dmat, bus_iocap_dmamap_t iocap_map,
 	iocap_keymngr_bus_dmamap_unload2_cb on_unmapped, void* arg1, void* arg2)
 {
-	struct bus_dma_impl *base_impl;
-
-	base_impl = ((struct bus_dma_tag_common *)iocap_dmat->base_tag)->impl;
-
 	// Transitions map to unloaded
-	iocap_enabled_tag_unassign_key(iocap_dmat, iocap_map, on_unmapped, arg1, arg2);
-
-	base_impl->map_unload(iocap_dmat->base_tag, iocap_map->base_map);
+	iocap_enabled_tag_unassign_key(iocap_dmat, iocap_map, on_unmapped, arg1, arg2, (on_unmapped == NULL));
 }
 
 static void
