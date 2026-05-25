@@ -71,8 +71,6 @@ struct vtblk_iocap_request {
 	uint8_t				 vbr_ack;
 	uint8_t				 vbr_requeue_on_error;
 	uint8_t				 vbr_busdma_wait;
-	/* TODO set to 1 if it has been dequeued and is awaiting unmapping? */
-	uint8_t				 vbr_quarantined;
 	int				 vbr_error;
 	TAILQ_ENTRY(vtblk_iocap_request)	 vbr_link;
 };
@@ -321,7 +319,7 @@ vtblk_iocap_probe(device_t dev)
 	if (virtio_get_device_type(dev) != virtio_blk_iocap_match.device_type)
 		return (ENXIO);
 	// If IOCaps are not supported by the device, reject it. The no-IOCap-specific driver will pick it up.
-	// TODO search the parent chain for a IOCap-capable bus. If it isn't present, drop to the IOCap driver.
+	// TODO search the parent chain for a IOCap-capable bus. If it isn't present, drop to the non-IOCap driver.
 	if (virtio_get_iocap_support(dev) == 0)
 		return (ENXIO);
 	if (bus_dma_tag_iocap_refinable(bus_get_dma_tag(dev)) == 0)
@@ -463,8 +461,8 @@ vtblk_iocap_attach(device_t dev)
 			.params = {
 				.rolling_epoch = {
 					// As per thesis: l_ops = ceil(q_ops / (n_l - 1)), ceil(x / y) with integer division = (x + y - 1) /
-					// This assumes virtio forces in-order consumption + enqueueing, even in the precense of out-of-order completion
-					// TODO is that true?
+					// This assumes virtio forces in-order consumption + enqueueing, even in the precense of out-of-order completion,
+					// which should be true: split and packed queues are both circular buffers.
 					.max_num_mappings_per_epoch = (virtq_iocap_size(sc->vtblk_iocap_vq) + 2) / 3,
 				}
 			}
@@ -1520,8 +1518,7 @@ vtblk_iocap_ident(struct vtblk_iocap_softc *sc)
 	buf.bio_data = dp->d_ident;
 	buf.bio_bcount = len;
 
-	// TODO Make this asynchronous, we really don't want to hand out
-	// full access to this struct
+	// This function asserts synchronous revocation.
 	VTBLK_LOCK(sc);
 	error = vtblk_iocap_poll_request(sc, req);
 	VTBLK_UNLOCK(sc);
@@ -1532,7 +1529,7 @@ vtblk_iocap_ident(struct vtblk_iocap_softc *sc)
 	}
 }
 
-// THIS FUNCTION IS FAKE AND FOR THINGS THAT REALLY DONT CARE ABOUT MEMORY SECURITY
+// This function asserts synchronous revocation!
 static int
 vtblk_iocap_poll_request(struct vtblk_iocap_softc *sc, struct vtblk_iocap_request *req)
 {
@@ -1555,7 +1552,7 @@ vtblk_iocap_poll_request(struct vtblk_iocap_softc *sc, struct vtblk_iocap_reques
 	KASSERT(req == req1,
 	    ("%s: polling completed %p not %p", __func__, req1, req));
 
-	// NOTE THIS SETS CALLBACK TO NULL BECAUSE IT DOESNT CARE ABOUT MEMORY SECURITY
+	// Setting the callback to null asserts synchronous revocation
 	vtblk_iocap_queue_complete_one(sc, req, NULL, NULL);
 	bp = req->vbr_bp;
 	error = bp->bio_error;
