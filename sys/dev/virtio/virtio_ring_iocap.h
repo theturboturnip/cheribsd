@@ -64,4 +64,4 @@ vring_iocap_init(struct vring_iocap *vr, unsigned int num, uint8_t *p,
         vr->used = (void *)roundup2(&vr->avail->ring[num], align);
 }
 
-#endif
+#endif /* VIRTIO_RING_IOCAP_H */
