@@ -37,7 +37,13 @@
 // STUBS
 #include <crypto/rijndael/rijndael.h>
 
+int iocaps_disable_encryption = 0;
+
 void ccap_aes_encrypt_128_func(const CCapU128* secret, const CCapU128* data, CCapU128* result) {
+    if (iocaps_disable_encryption) {
+        memcpy(result, data, 16);
+        return;
+    }
     rijndael_ctx ctx;
     rijndael_set_key(&ctx, *secret, 128);
     rijndael_encrypt(&ctx, *data, *result);
@@ -57,4 +63,3 @@ void ccap_panic_complete(void) {
 // and if C believes the panic funcion *could* return then it would complain about certain state that cannot be initialized correctly.
 // It can be overridden here.
 // #define LIBCCAP_NORETURN_SPECIFIER _Noreturn
-

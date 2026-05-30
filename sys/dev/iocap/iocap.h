@@ -32,4 +32,6 @@ inline CCapResult clear_iocap_virtio_except_next(struct iocap* iocap, uint16_t n
 	return ccap2024_11_clear_and_write_virtio_next(&iocap->cap, next);
 }
 
+extern int iocaps_disable_encryption;
+
 #endif

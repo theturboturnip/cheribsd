@@ -23,6 +23,7 @@
 #include <dev/ofw/ofw_bus_subr.h>
 
 #include "dev/fdt/simplebus.h"
+#include "iocap.h"
 
 // WE ARE ASSUMING WE ARE COMPILING FOR RISC-V HERE. WATCH OUT WHEN COMPILING FOR SOMETHING ELSE
 #define TOKENPASTE(a, b) a ## b // "##" is the "Token Pasting Operator"
@@ -277,6 +278,7 @@ static void iocap_keymngr_dbg_perfcounters(device_t);
 // SYSCTL_ADD_PROC is employed to ensure that arg2 is always 0x1000, 0x1008, 0x1010, or 0x1018.
 // IT WOULD BE BAD IF SOMEONE PASSED A DIFFERENT VALUE IN. IS THAT POSSIBLE?
 static int iocap_keymngr_dbg_perfcounters_sysctl(SYSCTL_HANDLER_ARGS);
+static int iocap_keymngr_dbg_toggle_encryption(SYSCTL_HANDLER_ARGS);
 
 // Assign n_key_ids key IDs from the key manager to a tag, without reusing key IDs already assigned to other tags.
 //
@@ -435,6 +437,10 @@ iocap_keymngr_attach(device_t dev)
 	    CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0x1018,
 	    iocap_keymngr_dbg_perfcounters_sysctl, "QU",
 	    "Number of incorrect IOCap reads handled by the key manager");
+	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "disable_encrypt",
+	    CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_WR | CTLFLAG_MPSAFE, sc, 0,
+	    iocap_keymngr_dbg_toggle_encryption, "QU",
+	    "Writable global toggle to disable IOCap encryption.");
 
 	iocap_keymngr_dbg_perfcounters(dev);
 
@@ -519,6 +525,25 @@ iocap_keymngr_dbg_perfcounters_sysctl(SYSCTL_HANDLER_ARGS)
 	error = sysctl_handle_64(oidp, &value, 0, req);
 
 	return error;
+}
+
+static int
+iocap_keymngr_dbg_toggle_encryption(SYSCTL_HANDLER_ARGS)
+{
+	uint64_t value;
+	int err;
+
+	if (!req->newptr) {
+		// read request
+		value = iocaps_disable_encryption;
+	}
+	err = sysctl_handle_64(oidp, &value, 0, req);
+	if (err) /* error */
+		return err;
+	if (req->newptr) {
+		iocaps_disable_encryption = value ? 1 : 0;
+	}
+	return 0;
 }
 
 // Assign n_key_ids key IDs to a tag, without reusing key IDs already assigned to other tags
